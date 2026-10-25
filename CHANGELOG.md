@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.4.0 (versionCode 14) — 2026-10-25
+## 0.4.1 (versionCode 15) — 2026-10-25
+
+Three behaviours changed by the user after reviewing 0.4.0 (they replace the plan's §7 return
+flow and the launch auto-connect):
+- **Minimising changes nothing on the sofa.** A massage runs to its end, a tap move or a full-body
+  preparation finishes (a held move stops — no finger is on it any more). The foreground service
+  keeps the link; the notification shows the sofa's state (「躺平・全身按摩 進行中・約剩 12 分鐘」)
+  and has 停止. Idle for 60 s in the background → the link is let go. Coming back (or any new
+  connection) shows the current state. The return-to-sofa flow and its banners are removed.
+- **A tap moves in one go; the user steps in only if it stops.** Tapping the moving card stops the
+  movement only (a massage carries on); 停止 still stops everything. A move stopped on the way
+  (tap, 停止, watchdog, lost status) offers 「繼續到…」 / 「回到…」 (where it started) /
+  「留在這裡」; voice 「繼續」 continues it when no massage is paused.
+- **No connection on launch.** Only an NFC tap or 「搜尋沙發」 connects; coming back from another app
+  reconnects (also a cold start ≤ 30 min after switching away while connected). The menu's
+  中斷連線 cancels any automatic reconnection.
+
+## 0.4.0 (versionCode 14) — 2026-10-25 (not distributed; superseded by 0.4.1)
 
 Implements the P0 and P1 items of `../improve-plan.md`.
 

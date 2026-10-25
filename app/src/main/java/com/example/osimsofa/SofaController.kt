@@ -20,9 +20,12 @@ import com.example.osimsofa.OsimProtocol.Posture
 
 /**
  * What the buttons, voice and the notification do (improve-plan §8). Every operation passes
- * [ControlPolicy]; movements and sessions are the pure flows ([MoveToTarget], [FullBodySession],
- * [ReturnToSofaFlow]) fed with statuses and a clock tick; every outcome becomes one [UserEvent]
- * for the screen, the spoken reply and the notification. Main thread only; Compose-observable.
+ * [ControlPolicy]; movements and sessions are the pure flows ([MoveToTarget], [FullBodySession])
+ * fed with statuses and a fixed-rate clock; every outcome becomes one [UserEvent] for the screen,
+ * the spoken reply and the notification. Main thread only; Compose-observable.
+ *
+ * Leaving the app changes nothing on the sofa (user decision 2026-10-25): what runs keeps running
+ * until it is done; the link is let go only once the sofa is idle, and coming back shows its state.
  */
 class SofaController(private val conn: SofaConnection, private val store: SharedPreferences) {
 
@@ -31,31 +34,39 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
     data class UserEvent(val text: String, val speak: Boolean, val problem: Boolean, val at: Long)
     data class MoveView(val target: Posture, val mode: Mode)
     data class SessionView(val minutes: Int, val stage: FullBodySession.Stage, val failure: String?, val confirmed: Boolean?)
-    data class ReturnView(val stage: ReturnToSofaFlow.Stage, val reason: String?)
+    /** A tap move that stopped on the way: offer to finish it, or to go back to where it began. */
+    data class Interrupted(val target: Posture, val origin: Posture?)
 
     /** The preset being moved to right now, if any. */
     var moving by mutableStateOf<MoveView?>(null); private set
     var session by mutableStateOf<SessionView?>(null); private set
-    var returning by mutableStateOf<ReturnView?>(null); private set
+    var interrupted by mutableStateOf<Interrupted?>(null); private set
     var lastEvent by mutableStateOf<UserEvent?>(null); private set
     /** Next full-body duration chosen on the screen (also what the bottom bar starts). */
     var want30 by mutableStateOf(false)
     /** Settings for the next manual massage (and the running one, while manual runs). */
     var manual by mutableStateOf(ManualSettings.DEFAULTS); private set
     var inBackground by mutableStateOf(false); private set
-    /** Shown until dismissed: the last return to the sofa did not finish. */
-    var returnProblem by mutableStateOf<String?>(null); private set
 
     /** Every user-facing outcome (spoken by the app, mirrored in the notification). */
     var onEvent: ((UserEvent) -> Unit)? = null
+    /** The sofa's state in one line, whenever it changes (the notification's title). */
+    var onSummary: ((String) -> Unit)? = null
+    /** Hold the CPU awake while the sofa moves with the app in the background: a sleeping CPU
+     *  would pause the preset stream and resume it later. Set by [SofaApplication]. */
+    var keepAwake: ((Boolean) -> Unit)? = null
 
     private val main = Handler(Looper.getMainLooper())
     private var mover: MoveToTarget? = null
+    private var moverOrigin: Posture? = null
     private var fullBody: FullBodySession? = null
-    private var back: ReturnToSofaFlow? = null
     private val expects = ArrayList<Expect>()
     private var lastFault = 0
     private var reconnectOnForeground = false
+    private var lastSummary: String? = null
+    private var awake = false
+    private var tickPending = false
+    private var lingerPending = false
     private val ticker = Runnable { tick() }
     private val linger = Runnable { lingerDisconnect() }
 
@@ -66,16 +77,11 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         conn.onStatus = { onStatus(it) }
         conn.onLost = { onLinkLost(it) }
         conn.onCommandFailed = { report("沙發沒有回應「${it.label}」", problem = true) }
-        returnProblem = when (store.getString(KEY_RETURN, null)) {
-            RETURN_PENDING -> "上次回到沙發位置沒有完成（App 被關閉或連線中斷），請查看沙發目前的位置"
-            RETURN_ABORTED -> store.getString(KEY_RETURN_REASON, null)
-            else -> null
-        }
     }
 
     // ================================================================== posture
 
-    /** Tap (or voice): move to the preset and stop there by itself. */
+    /** Tap (or voice): move to the preset in one go — it stops by itself on arrival. */
     fun moveTo(p: Posture, source: Source = Source.BUTTON) = startMove(p, Mode.AUTO, source)
 
     /** Press-and-hold on a card: moves while held, stops on release or arrival. */
@@ -87,10 +93,28 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         afterStep()
     }
 
+    /** Stop only the movement (the moving card tapped again) — a running massage carries on. */
+    fun stopMove() {
+        val m = mover ?: return
+        if (m.mode == Mode.AUTO && m.active) interrupted = Interrupted(m.target, moverOrigin)
+        apply(m.cancel(now()))
+        report("已停止移動，尚未到${Names.short(m.target)}位置", speak = false)
+        afterStep()
+    }
+
+    /** After an interrupted move: carry on to where it was going … */
+    fun continueMove() { interrupted?.let { moveTo(it.target) } }
+
+    /** … or go back to where it started. */
+    fun returnToOrigin() { interrupted?.origin?.let { moveTo(it) } }
+
+    fun dismissInterrupted() { interrupted = null }
+
     private fun startMove(p: Posture, mode: Mode, source: Source) {
         if (!allowed(Op.MOVE)) return
         val s = conn.status ?: return
         clearNotes()
+        interrupted = null
         mover?.let { if (it.active) apply(it.cancel(now())) }
         mover = null
         if (cancelPreparation()) report("已取消全身按摩準備", speak = false)
@@ -105,6 +129,7 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
             report("已在${Names.short(p)}位置")
         } else {
             mover = m
+            moverOrigin = Posture.entries.firstOrNull { MoveToTarget.reached(it, s) }
             if (mode == Mode.AUTO) report("${Names.moving(p)}，到位自動停止", speak = source == Source.VOICE)
             else report("${Names.moving(p)}，放開即停", speak = false)
             apply(fx)
@@ -120,9 +145,15 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
             Result.RELEASED -> report(
                 if (m.elapsedMs < SHORT_PRESS_MS) "按住不放才會移動；點一下會自動調整到$target"
                 else "已停止，尚未到${target}位置", speak = false)
-            Result.TIMED_OUT -> report("尚未到${target}位置，已停止（超過 ${MoveToTarget.CAP_MS / 1000} 秒）", problem = true)
+            Result.TIMED_OUT -> {
+                interrupted = Interrupted(m.target, moverOrigin)
+                report("尚未到${target}位置，已停止（超過 ${MoveToTarget.CAP_MS / 1000} 秒）", problem = true)
+            }
+            Result.STALE -> {
+                interrupted = Interrupted(m.target, moverOrigin)
+                report("沒有收到沙發回報，已停止移動", problem = true)
+            }
             Result.FAULT -> report("沙發回報錯誤 ${m.faultCode}，已停止移動", problem = true)
-            Result.STALE -> report("沒有收到沙發回報，已停止移動", problem = true)
             Result.ALREADY_THERE, Result.CANCELLED, null -> {}
         }
     }
@@ -153,6 +184,7 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         }
         mover?.let { if (it.active) apply(it.cancel(now())) }
         mover = null
+        interrupted = null
         clearNotes()
         want30 = minutes == 30
         val s = FullBodySession(minutes)
@@ -205,10 +237,16 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         afterStep()
     }
 
+    /** 繼續: a paused massage first; otherwise a move that was stopped on the way. */
     fun resume(source: Source = Source.BUTTON) {
         if (!allowed(Op.RESUME)) return
         val s = conn.status ?: return
-        if (!s.paused) { report("沒有暫停中的按摩", speak = source == Source.VOICE); return }
+        if (!s.paused) {
+            val i = interrupted
+            if (i != null) { moveTo(i.target, source); return }
+            report("沒有暫停中的按摩", speak = source == Source.VOICE)
+            return
+        }
         conn.enqueue(listOf(OsimProtocol.resume()))
         expect("已繼續按摩", "沙發沒有回報繼續") { !it.paused }
         afterStep()
@@ -222,18 +260,25 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
     fun stopAll(source: Source = Source.BUTTON) {
         val t0 = SystemClock.uptimeMillis()
         stopEpoch++
-        val wasReturning = back?.active == true
+        val m = mover
+        if (m != null && m.mode == Mode.AUTO && m.active) interrupted = Interrupted(m.target, moverOrigin)
         // The flows' own releases are not needed: stopNow sends release + stopMassage first.
         mover?.cancel(now()); mover = null
         fullBody?.cancel(now())
-        back?.cancel(now(), "已按停止，沒有回到沙發位置")
         expects.clear()
         clearNotes()
         conn.stopNow()
-        conn.log("STOP 來源 $source，${SystemClock.uptimeMillis() - t0} ms 內寫出" + if (wasReturning) "（中止回到沙發）" else "")
+        conn.log("STOP 來源 $source，${SystemClock.uptimeMillis() - t0} ms 內寫出")
         if (conn.operable) report("已停止")
         else report("沙發未連線，無法確認沙發是否已停止，請查看沙發", problem = true)
         afterStep()
+    }
+
+    /** The menu's 中斷連線: no automatic reconnection afterwards. */
+    fun disconnect() {
+        reconnectOnForeground = false
+        clearSwitch()
+        conn.disconnect()
     }
 
     // ================================================================== voice
@@ -338,63 +383,81 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
 
     // ================================================================== app lifecycle
 
-    /** The app is no longer visible (Home, another app, screen off): stop → back to the sofa → defaults. */
+    /**
+     * The app is no longer visible (Home, another app, screen off). Nothing changes on the sofa:
+     * a tap move or a full-body preparation finishes, a massage runs to its end, and the
+     * notification shows the state and offers 停止. Only a held button lets go (no finger can be on
+     * it). Once the sofa is idle the link is let go; coming back reconnects and shows the state.
+     */
     fun onAppBackground() {
         inBackground = true
-        main.removeCallbacks(linger)
         when (conn.phase) {
             SofaConnection.Phase.READY -> {}
             SofaConnection.Phase.SCANNING, SofaConnection.Phase.CONNECTING,
             SofaConnection.Phase.DISCOVERING, SofaConnection.Phase.VERIFYING -> {
-                conn.cancel(); reconnectOnForeground = true; return
+                conn.cancel(); reconnectOnForeground = true; rememberSwitch(); return
             }
             else -> return
         }
-        if (back?.active == true) return
-        // Drop whatever is still queued or on its way (a start key, manual settings, a stream) and
-        // stop first — a command sent before the app left must not start a massage afterwards.
-        mover?.cancel(now()); mover = null
-        fullBody?.cancel(now())
-        expects.clear()
-        conn.stopNow()
-        val s = conn.status
-        val fresh = (conn.statusAgeMs() ?: Long.MAX_VALUE) <= ControlPolicy.STALE_MS
-        val f = ReturnToSofaFlow()
-        back = f
-        recordReturn(RETURN_PENDING, null)
-        conn.log("BACKGROUND App 已縮小，開始回到沙發流程")
-        apply(f.begin(s, fresh, now()))
+        rememberSwitch()
+        mover?.takeIf { it.mode == Mode.HOLD }?.let { apply(it.fingerUp(now())) }
+        conn.log("BACKGROUND App 已縮小，沙發維持目前狀態：${summary(conn.status)}")
         afterStep()
     }
 
     fun onAppForeground() {
         inBackground = false
-        main.removeCallbacks(linger)
+        cancelLinger()
+        if (conn.operable) {
+            clearSwitch()
+            if (conn.status != null) report("沙發目前：${summary(conn.status)}", speak = false)
+            afterStep()
+            return
+        }
         if (reconnectOnForeground && conn.phase in setOf(SofaConnection.Phase.IDLE, SofaConnection.Phase.FAILED) && conn.hasPermissions()) {
             reconnectOnForeground = false
-            conn.log("回到前景，重新連線沙發")
+            conn.log("從其他 App 切回來，重新連線沙發")
             conn.startAutoConnect()
         }
     }
 
-    fun dismissReturnProblem() {
-        returnProblem = null
-        store.edit().remove(KEY_RETURN).remove(KEY_RETURN_REASON).apply()
+    /** A cold start shortly after switching away with the sofa connected (the system ended the
+     *  app meanwhile) counts as switching back: reconnect. Any other start does not. */
+    fun reconnectAfterSwitch(): Boolean {
+        val at = store.getLong(KEY_SWITCHED_AT, 0L)
+        clearSwitch()
+        val ago = System.currentTimeMillis() - at
+        return at > 0L && ago in 0..SWITCH_WINDOW_MS
     }
 
-    private fun recordReturn(state: String, reason: String?) {
-        store.edit().putString(KEY_RETURN, state).putString(KEY_RETURN_REASON, reason).apply()
-    }
+    private fun rememberSwitch() = store.edit().putLong(KEY_SWITCHED_AT, System.currentTimeMillis()).apply()
+    private fun clearSwitch() = store.edit().remove(KEY_SWITCHED_AT).apply()
 
-    /** After the return, stay connected a little (the user may come right back), then let the sofa go. */
+    /** In the background with nothing running on the sofa: let it go after a while (it frees the
+     *  sofa for the remote or the OSIM app, and saves battery). */
     private fun lingerDisconnect() {
-        if (!inBackground || back?.active == true) return
-        conn.log("BACKGROUND 回位流程結束，${LINGER_MS / 1000} 秒後中斷連線")
+        lingerPending = false
+        if (!inBackground || !idle()) return
+        conn.log("BACKGROUND 沙發沒有進行中的功能，中斷連線（切回 App 時自動重新連線）")
         reconnectOnForeground = true
         conn.disconnect()
     }
 
+    private fun idle(): Boolean =
+        mover == null && fullBody?.preparing != true && expects.isEmpty() && conn.status?.massageRunning != true
+
+    private fun cancelLinger() { if (lingerPending) { lingerPending = false; main.removeCallbacks(linger) } }
+
     // ================================================================== status / clock
+
+    /** A new connection reached the sofa: say what it is doing right now. */
+    fun onOperable() {
+        lastFault = conn.status?.errorCode ?: 0
+        expects.clear()
+        report("已連線。沙發目前：${summary(conn.status)}", speak = false)
+        if (lastFault != 0) report("沙發回報錯誤 $lastFault：${conn.status?.errorText}", problem = true)
+        afterStep()
+    }
 
     private fun onStatus(s: SofaStatus) {
         val t = now()
@@ -405,7 +468,6 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         }
         mover?.let { apply(it.onStatus(s, t)) }
         fullBody?.let { apply(it.onStatus(s, t)) }
-        back?.let { apply(it.onStatus(s, t)) }
         val iter = expects.iterator()
         while (iter.hasNext()) {
             val e = iter.next()
@@ -420,7 +482,6 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         val last = conn.statusAt
         mover?.let { apply(it.onTick(t, last)) }
         fullBody?.let { apply(it.onTick(t, last)) }
-        back?.let { apply(it.onTick(t, last)) }
         val iter = expects.iterator()
         while (iter.hasNext()) {
             val e = iter.next()
@@ -429,27 +490,16 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         afterStep()
     }
 
-    /** A new connection reached the sofa: start the fault announcements afresh. */
-    fun onOperable() {
-        lastFault = 0
-        expects.clear()
-    }
-
     /** The link to an operable sofa ended. [why] is null when the user disconnected on purpose. */
     private fun onLinkLost(why: String?) {
         mover?.cancel(now()); mover = null
         fullBody?.cancel(now())
-        back?.cancel(now(), "連線中斷，無法確認是否已回到沙發位置，請查看沙發")
         expects.clear()
+        interrupted = null
         lastFault = 0
         if (why != null) report(why, problem = true)
         afterStep()
     }
-
-    /** Hold the CPU awake while the sofa moves with the screen off (the return after minimising):
-     *  a sleeping CPU would pause the stream and resume it later. Set by [SofaApplication]. */
-    var keepAwake: ((Boolean) -> Unit)? = null
-    private var awake = false
 
     /** Settle finished flows, refresh what the screen shows, keep the clock and the poll rate right. */
     private fun afterStep() {
@@ -462,31 +512,29 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
             }
             if (f.finished) fullBody = null
         }
-        back?.let { f ->
-            if (f.finished) {
-                back = null
-                // Done: the spoken / shown event says so. Not done: a banner stays until dismissed.
-                if (f.stage == ReturnToSofaFlow.Stage.DONE) { recordReturn(RETURN_DONE, null); returnProblem = null }
-                else { recordReturn(RETURN_ABORTED, f.abortReason); returnProblem = f.abortReason }
-                if (inBackground) main.postDelayed(linger, LINGER_MS)
-            }
-        }
-        returning = back?.let { ReturnView(it.stage!!, it.abortReason) }
         moving = mover?.let { MoveView(it.target, it.mode) }
             ?: fullBody?.move?.takeIf { it.active }?.let { MoveView(it.target, Mode.AUTO) }
-            ?: back?.move?.takeIf { it.active }?.let { MoveView(it.target, Mode.AUTO) }
         // A running program only needs statuses; everything else also needs the clock.
-        val busy = mover != null || fullBody?.let { it.stage != FullBodySession.Stage.RUNNING } == true ||
-            back != null || expects.isNotEmpty()
+        val busy = mover != null || fullBody?.let { it.stage != FullBodySession.Stage.RUNNING } == true || expects.isNotEmpty()
         conn.pollFast = busy || fullBody != null || conn.status?.massageRunning == true || conn.status?.fault == true
         // A fixed-rate clock: statuses arrive every ~100 ms while a preset streams, so re-arming the
         // tick on each of them would postpone the watchdog forever.
         if (busy && !tickPending) { tickPending = true; main.postDelayed(ticker, TICK_MS) }
         if (!busy && tickPending) { tickPending = false; main.removeCallbacks(ticker) }
-        val wantAwake = inBackground && (back != null || mover != null)
+        val wantAwake = inBackground && (mover != null || fullBody?.preparing == true)
         if (wantAwake != awake) { awake = wantAwake; keepAwake?.invoke(wantAwake) }
+        if (inBackground && conn.operable && idle()) {
+            if (!lingerPending) { lingerPending = true; main.postDelayed(linger, LINGER_MS) }
+        } else cancelLinger()
+        if (conn.operable) {
+            val line = summary(conn.status)
+            if (line != lastSummary) { lastSummary = line; onSummary?.invoke(line) }
+        } else lastSummary = null
     }
-    private var tickPending = false
+
+    /** 「躺平・全身按摩 進行中・約剩 12 分鐘」 — the screen's status card in one line. */
+    fun summary(s: SofaStatus?): String =
+        (moving?.let { "移動中 → ${Names.short(it.target)}" } ?: Names.posture(s)) + "・" + Names.massage(s)
 
     /** A new action replaces the last full-body failure note on the card. */
     private fun clearNotes() {
@@ -499,8 +547,7 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
 
     private fun allowed(op: Op): Boolean {
         val v = ControlPolicy.check(op, ControlPolicy.Context(
-            operable = conn.operable, status = conn.status, statusAgeMs = conn.statusAgeMs(),
-            inBackground = inBackground, returning = back?.active == true))
+            operable = conn.operable, status = conn.status, statusAgeMs = conn.statusAgeMs(), inBackground = inBackground))
         if (v is ControlPolicy.Verdict.Block) {
             conn.log("BLOCK $op：${v.reason}")
             report(v.reason, problem = true)
@@ -515,7 +562,6 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
             Effect.Release -> conn.release()
             is Effect.Send -> conn.enqueue(e.cmds)
             is Effect.Report -> report(e.text, e.speak, e.problem)
-            Effect.ResetDefaults -> { want30 = false; manual = ManualSettings.DEFAULTS; conn.log("RESET 下次使用預設：15 分鐘、${OsimProtocol.AutoProfile.LEVEL3.zh}") }
         }
     }
 
@@ -532,11 +578,10 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         const val TICK_MS = 250L
         const val EXPECT_MS = 6_000L
         const val SHORT_PRESS_MS = 600L
-        const val LINGER_MS = 30_000L
-        private const val KEY_RETURN = "return_state"
-        private const val KEY_RETURN_REASON = "return_reason"
-        private const val RETURN_PENDING = "pending"
-        private const val RETURN_DONE = "done"
-        private const val RETURN_ABORTED = "aborted"
+        /** Idle in the background this long → let the sofa go. */
+        const val LINGER_MS = 60_000L
+        /** A cold start within this time after switching away still reconnects. */
+        const val SWITCH_WINDOW_MS = 30 * 60_000L
+        private const val KEY_SWITCHED_AT = "switched_away_at"
     }
 }

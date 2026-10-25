@@ -54,4 +54,26 @@ object Names {
         OsimProtocol.FootSeat.FOOT_VIBRATION -> "足部振動"
         OsimProtocol.FootSeat.SEAT_VIBRATION -> "臀部振動"
     }
+
+    /** Where the sofa is, from its own report. 沙發 needs the footrest home too; 待機 = no massage. */
+    fun posture(s: SofaStatus?): String = when {
+        s == null -> "讀取中…"
+        MoveToTarget.reached(Posture.SOFA, s) -> if (s.massageRunning) "沙發" else "沙發（待機）"
+        s.sofaPosition -> "沙發（腳托未收回）"
+        s.uprightPosition -> "坐式"
+        s.reclinePosition -> "躺平"
+        else -> "不在預設位置"
+    }
+
+    /** What the sofa is doing, e.g. 「全身按摩 進行中・約剩 12 分鐘」. */
+    fun massage(s: SofaStatus?): String {
+        if (s == null) return "—"
+        val what = when {
+            s.programNo == 0 -> return "沒有按摩"
+            s.programNo == OsimProtocol.MANUAL_PROGRAM_NO -> MANUAL
+            s.programNo == OsimProtocol.VGRIP_PROGRAM_NO -> "V-Grip"
+            else -> OsimProtocol.AutoProgram.byNumber(s.programNo)?.zh ?: "程式 ${s.programNo}"
+        }
+        return if (s.paused) "$what・暫停中" else "$what 進行中・約剩 ${s.remainingMin} 分鐘"
+    }
 }

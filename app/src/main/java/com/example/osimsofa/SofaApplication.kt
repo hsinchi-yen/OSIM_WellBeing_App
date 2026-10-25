@@ -11,7 +11,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
  * Owns the sofa session for the whole process, so turning the phone or a new Activity never
  * reconnects or restarts anything (improve-plan §7.2). The app counts as "minimised" when no
  * Activity is visible any more (ProcessLifecycleOwner: Home, another app, screen off) — not for a
- * rotation or a permission dialog.
+ * rotation or a permission dialog. Minimising changes nothing on the sofa (see SofaController).
  */
 class SofaApplication : Application() {
 
@@ -28,15 +28,16 @@ class SofaApplication : Application() {
             if (e.speak) speaker.say(e.text, interrupt = e.problem)
             SofaService.update(this, e.text)
         }
+        controller.onSummary = { SofaService.update(this, controller.lastEvent?.text) }
         conn.onOperable = {
             controller.onOperable()
             SofaService.start(this)
         }
         conn.onClosed = { SofaService.stop(this) }
-        // The return after minimising may run with the screen off: keep the CPU up meanwhile, or
-        // the preset stream would pause and resume whenever the phone wakes (capped at 2 minutes).
+        // A move that carries on after the app is minimised may run with the screen off: keep the CPU
+        // up meanwhile, or the preset stream would pause and resume whenever the phone wakes (≤ 2 min).
         val wake = getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "uDivaSofa:return").apply { setReferenceCounted(false) }
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "uDivaSofa:move").apply { setReferenceCounted(false) }
         controller.keepAwake = { on -> if (on) wake.acquire(2 * 60_000L) else if (wake.isHeld) wake.release() }
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) = controller.onAppForeground()

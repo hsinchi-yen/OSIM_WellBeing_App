@@ -20,8 +20,8 @@ import androidx.core.content.ContextCompat
 /**
  * Keeps the Bluetooth link alive while the app is not on screen (improve-plan B01): a
  * `connectedDevice` foreground service, started while the app is in front (as Android 12+ requires)
- * once the sofa is operable, stopped when the link closes. Its notification shows what the sofa is
- * doing — e.g. 「正在回到沙發位置」 — and has a 停止 action.
+ * once the sofa is operable, stopped when the link closes. Its notification shows the sofa's state
+ * (e.g. 「躺平・全身按摩 進行中・約剩 12 分鐘」), the latest outcome, and a 停止 action.
  */
 class SofaService : Service() {
 
@@ -87,8 +87,8 @@ class SofaService : Service() {
             ctx.stopService(Intent(ctx, SofaService::class.java))
         }
 
-        /** Mirror the latest outcome in the notification. */
-        fun update(ctx: Context, text: String) {
+        /** Refresh the notification: the sofa's state as the title, [text] (the latest outcome) below. */
+        fun update(ctx: Context, text: String?) {
             if (!running) return
             if (Build.VERSION.SDK_INT >= 33 &&
                 ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
@@ -99,8 +99,10 @@ class SofaService : Service() {
             val nm = ctx.getSystemService(NotificationManager::class.java)
             if (nm.getNotificationChannel(CHANNEL) == null) {
                 nm.createNotificationChannel(NotificationChannel(CHANNEL, "沙發連線", NotificationManager.IMPORTANCE_LOW)
-                    .apply { description = "連線中與回到沙發位置時顯示，可在此停止" })
+                    .apply { description = "連線中顯示沙發目前的狀態，可在此停止" })
             }
+            val app = ctx.applicationContext as SofaApplication
+            val state = app.controller.summary(app.conn.status)
             val open = PendingIntent.getActivity(ctx, 0,
                 Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -108,8 +110,8 @@ class SofaService : Service() {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             return NotificationCompat.Builder(ctx, CHANNEL)
                 .setSmallIcon(R.drawable.ic_stat_sofa)
-                .setContentTitle("uDiva 沙發已連線")
-                .setContentText(text ?: "可在此停止沙發")
+                .setContentTitle(state)                                   // what the sofa is doing now
+                .setContentText(text ?: "可在此停止沙發")                  // the latest outcome
                 .setStyle(NotificationCompat.BigTextStyle().bigText(text ?: "可在此停止沙發"))
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)

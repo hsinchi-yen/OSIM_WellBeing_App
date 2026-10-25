@@ -130,6 +130,10 @@ import kotlinx.coroutines.launch
 class SofaActions(
     val tapPosture: (Posture) -> Unit,
     val holdPosture: (Posture, Boolean) -> Unit,   // press-and-hold: true on long press, false on release
+    val stopMove: () -> Unit,                      // the moving card tapped again: movement only
+    val continueMove: () -> Unit,                  // after an interrupted move: on to its target …
+    val returnToOrigin: () -> Unit,                // … or back to where it started
+    val dismissInterrupted: () -> Unit,
     val startFullBody: () -> Unit,
     val setWant30: (Boolean) -> Unit,
     val startManual: () -> Unit,
@@ -146,7 +150,6 @@ class SofaActions(
     val enableBluetooth: () -> Unit,
     val grantPermissions: () -> Unit,
     val openAppSettings: () -> Unit,
-    val dismissReturnProblem: () -> Unit,
     val copyDiagnostics: () -> Unit,
     val setTranscripts: (Boolean) -> Unit,
     /** Debug builds only: write raw bytes. */
@@ -182,7 +185,7 @@ fun SofaApp(conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: 
                 Page.DIAGNOSTICS -> DiagnosticsScreen(conn, env, actions, stopBar) { page = Page.MAIN }
                 Page.MAIN ->
                     if (conn.phase == Phase.READY) ControlScreen(conn, ctrl, voice, env, actions, onPage = { page = it })
-                    else ConnectScreen(conn, ctrl, env, actions, onPage = { page = it })
+                    else ConnectScreen(conn, env, actions, onPage = { page = it })
             }
         }
     }
@@ -191,7 +194,7 @@ fun SofaApp(conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: 
 // ================================================================ connect screen
 
 @Composable
-private fun ConnectScreen(conn: SofaConnection, ctrl: SofaController, env: UiEnv, a: SofaActions, onPage: (Page) -> Unit) {
+private fun ConnectScreen(conn: SofaConnection, env: UiEnv, a: SofaActions, onPage: (Page) -> Unit) {
     val busy = conn.phase in listOf(Phase.SCANNING, Phase.CONNECTING, Phase.DISCOVERING, Phase.VERIFYING)
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp),
@@ -201,7 +204,6 @@ private fun ConnectScreen(conn: SofaConnection, ctrl: SofaController, env: UiEnv
         Text("uDiva 沙發", style = MaterialTheme.typography.displaySmall, modifier = Modifier.semantics { heading() })
         Spacer(Modifier.height(6.dp))
         Text(if (env.hasNfc) "靠近感應，即刻掌控" else "搜尋沙發，即刻掌控", style = MaterialTheme.typography.bodyLarge, color = SofaColors.Muted)
-        ctrl.returnProblem?.let { Spacer(Modifier.height(16.dp)); ReturnProblemCard(it, a) }
         Spacer(Modifier.height(28.dp))
 
         when {
@@ -353,7 +355,7 @@ private fun ControlScreen(conn: SofaConnection, ctrl: SofaController, voice: Voi
                 bottom = padding.calculateBottomPadding() + 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item(key = "banners") { Banners(ctrl, status, age, a) }
+            item(key = "banners") { Banners(status, age) }
             item(key = "status") { StatusCard(status, ctrl, a) }
             item(key = "postures") { PostureSection(status, ctrl, a) }
             item(key = "fullbody") { FullBodyCard(status, ctrl, a) }
@@ -468,21 +470,8 @@ private fun VoicePanel(voice: VoiceInput, env: UiEnv, a: SofaActions) {
 }
 
 @Composable
-private fun Banners(ctrl: SofaController, s: SofaStatus?, age: Long?, a: SofaActions) {
+private fun Banners(s: SofaStatus?, age: Long?) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        ctrl.returning?.let {
-            Card(colors = CardDefaults.cardColors(containerColor = SofaColors.SurfaceHigher), border = BorderStroke(1.dp, SofaColors.Champagne)) {
-                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(24.dp), color = SofaColors.Champagne, strokeWidth = 3.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text("正在回到沙發位置", style = MaterialTheme.typography.titleMedium)
-                        Text("App 縮小後會停止按摩並回到沙發位置；按「停止」可中止", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
-                    }
-                }
-            }
-        }
-        ctrl.returnProblem?.let { ReturnProblemCard(it, a) }
         if (s != null && s.fault) {
             Card(colors = CardDefaults.cardColors(containerColor = SofaColors.CoralDeep), border = BorderStroke(1.dp, SofaColors.Coral)) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -505,24 +494,13 @@ private fun Banners(ctrl: SofaController, s: SofaStatus?, age: Long?, a: SofaAct
     }
 }
 
-@Composable
-private fun ReturnProblemCard(text: String, a: SofaActions) {
-    Card(colors = CardDefaults.cardColors(containerColor = SofaColors.SurfaceHigh), border = BorderStroke(1.dp, SofaColors.Champagne)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("上次回到沙發位置沒有完成", style = MaterialTheme.typography.titleMedium, color = SofaColors.Champagne)
-            Text(text, style = MaterialTheme.typography.bodyMedium)
-            TextButton(onClick = a.dismissReturnProblem, modifier = Modifier.heightIn(min = 48.dp)) { Text("知道了") }
-        }
-    }
-}
-
 /** Current posture + massage, with the single 暫停／繼續 button while a massage runs. */
 @Composable
 private fun StatusCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
     Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = SofaColors.SurfaceHigh)) {
         Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            StatusLine("目前姿勢", ctrl.moving?.let { "移動中 → ${Names.short(it.target)}" } ?: postureText(s))
-            StatusLine("按摩", massageText(s))
+            StatusLine("目前姿勢", ctrl.moving?.let { "移動中 → ${Names.short(it.target)}" } ?: Names.posture(s))
+            StatusLine("按摩", Names.massage(s))
             if (s != null && (s.footFrontLimit || s.ottoman || !s.footBackLimit)) {
                 StatusLine("腳托", when {
                     s.footFrontLimit -> "伸出到底"
@@ -539,26 +517,6 @@ private fun StatusCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
             }
         }
     }
-}
-
-private fun postureText(s: SofaStatus?): String = when {
-    s == null -> "讀取中…"
-    MoveToTarget.reached(Posture.SOFA, s) -> if (s.massageRunning) "沙發" else "沙發（待機）"
-    s.sofaPosition -> "沙發（腳托未收回）"
-    s.uprightPosition -> "坐式"
-    s.reclinePosition -> "躺平"
-    else -> "不在預設位置"
-}
-
-private fun massageText(s: SofaStatus?): String {
-    if (s == null) return "—"
-    val what = when {
-        s.programNo == 0 -> return "沒有按摩"
-        s.programNo == OsimProtocol.MANUAL_PROGRAM_NO -> "手動按摩"
-        s.programNo == OsimProtocol.VGRIP_PROGRAM_NO -> "V-Grip"
-        else -> AutoProgram.byNumber(s.programNo)?.zh ?: "程式 ${s.programNo}"
-    }
-    return if (s.paused) "$what・暫停中" else "$what 進行中・約剩 ${s.remainingMin} 分鐘"
 }
 
 /** Label beside the value; at large font sizes above it, so 「目前姿勢」 never breaks mid-word. */
@@ -594,14 +552,39 @@ private fun PostureSection(s: SofaStatus?, ctrl: SofaController, a: SofaActions)
             if (stacked) Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { cards.forEach { it(Modifier.fillMaxWidth()) } }
             else Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) { cards.forEach { it(Modifier.weight(1f)) } }
         }
+        ctrl.interrupted?.let { InterruptedCard(it, a) }
+    }
+}
+
+/** A tap move stopped on the way (Stop, tapped again, or no arrival in time): the user decides. */
+@Composable
+private fun InterruptedCard(i: SofaController.Interrupted, a: SofaActions) {
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = SofaColors.SurfaceHigher),
+        border = BorderStroke(1.dp, SofaColors.Champagne)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("移動在途中停下，尚未到${Names.short(i.target)}", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = a.continueMove, modifier = Modifier.weight(1f).heightIn(min = 52.dp)) {
+                    Text("繼續到${Names.short(i.target)}", maxLines = 2, textAlign = TextAlign.Center)
+                }
+                i.origin?.let { o ->
+                    OutlinedButton(onClick = a.returnToOrigin, modifier = Modifier.weight(1f).heightIn(min = 52.dp),
+                        border = BorderStroke(1.dp, SofaColors.Champagne)) {
+                        Text("回到${Names.short(o)}", maxLines = 2, textAlign = TextAlign.Center)
+                    }
+                }
+            }
+            TextButton(onClick = a.dismissInterrupted, modifier = Modifier.heightIn(min = 48.dp)) { Text("留在這裡") }
+        }
     }
 }
 
 /**
- * Tap → move to the preset by itself (tap again or 停止 to stop). Long press → move only while
- * held. A press the list takes over as a scroll counts as a release, so the sofa stops.
- * TalkBack gets the auto move as the click action and 停止 as a custom action — nobody has to
- * keep a finger on a button they cannot see.
+ * Tap → move to the preset in one go, stopping there by itself; tapping the moving card again
+ * stops the movement only (a running massage carries on). Long press → move only while held. A
+ * press the list takes over as a scroll counts as a release, so the sofa stops. TalkBack gets the
+ * automatic move as the click action and 停止移動 as a custom action — nobody has to keep a finger
+ * on a button they cannot see.
  */
 @Composable
 private fun PostureCard(p: Posture, icon: ImageVector, s: SofaStatus?, ctrl: SofaController, a: SofaActions, wide: Boolean, modifier: Modifier) {
@@ -623,10 +606,10 @@ private fun PostureCard(p: Posture, icon: ImageVector, s: SofaStatus?, ctrl: Sof
             .semantics(mergeDescendants = true) {
                 role = Role.Button
                 stateDescription = sub
-                onClick(label = if (movingHere) "停止" else "自動調整到${Names.short(p)}") {
-                    if (movingHere) a.stop() else a.tapPosture(p); true
+                onClick(label = if (movingHere) "停止移動" else "自動調整到${Names.short(p)}") {
+                    if (movingHere) a.stopMove() else a.tapPosture(p); true
                 }
-                customActions = listOf(CustomAccessibilityAction("停止") { a.stop(); true })
+                customActions = listOf(CustomAccessibilityAction("停止移動") { a.stopMove(); true })
             }
             .pointerInput(p) {
                 detectTapGestures(
@@ -635,7 +618,7 @@ private fun PostureCard(p: Posture, icon: ImageVector, s: SofaStatus?, ctrl: Sof
                         try { tryAwaitRelease() } finally { if (holding) { holding = false; a.holdPosture(p, false) } }
                     },
                     onLongPress = { holding = true; a.holdPosture(p, true) },
-                    onTap = { if (movingNow) a.stop() else a.tapPosture(p) },
+                    onTap = { if (movingNow) a.stopMove() else a.tapPosture(p) },
                 )
             },
         colors = CardDefaults.cardColors(containerColor = if (movingHere) SofaColors.SurfaceHigher else SofaColors.Surface),
@@ -805,7 +788,7 @@ private fun MoreRow(a: SofaActions, onPage: (Page) -> Unit) {
                 Icon(Icons.Filled.Info, null); Spacer(Modifier.width(6.dp)); Text("使用說明", maxLines = 1)
             }
         }
-        Text("「音樂」會開啟 Spotify，本 App 隨之進入背景：按摩會停止、沙發回到沙發位置。", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
+        Text("「音樂」會開啟 Spotify；本 App 在背景時，沙發維持目前的按摩與姿勢，可從通知列停止。", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
     }
 }
 
@@ -834,11 +817,14 @@ private fun GuideScreen(stopBar: @Composable () -> Unit, onBack: () -> Unit) {
         Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()).padding(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)) {
             GuideCard("連線沙發", listOf(
-                "開啟 App 會自動連線上次的沙發；也可將手機靠近沙發感應區，或點「搜尋沙發」。",
+                "將手機靠近沙發感應區（NFC）即自動連線；或點「搜尋沙發」。開啟 App 本身不會自動連線。",
+                "從其他 App 切回來時，會自動重新連上剛才的沙發。",
                 "感應後優先連線那一張沙發；附近有多個沙發裝置又無法確定時，會列出讓你選。",
             ))
             GuideCard("三種姿勢", listOf(
-                "坐式、躺平、沙發（待機）。點一下：自動調整到位，到位就停；移動中再點一下或按「停止」即停。",
+                "坐式、躺平、沙發（待機）。點一下：一次調整到位，到位就停。",
+                "移動中再點一下同一張卡只停止移動（按摩照常）；下方「停止」會停止全部。",
+                "中途停下時會問你：「繼續到…」或「回到原本位置」；也可以說「繼續」。",
                 "按住：只在按住時移動，放開就停。",
                 "沙發（待機）會先停止按摩，再回到沙發位置。",
                 "「目前姿勢」依沙發回報顯示；沒有按摩不代表已回到沙發位置。",
@@ -865,11 +851,11 @@ private fun GuideScreen(stopBar: @Composable () -> Unit, onBack: () -> Unit) {
                 "「不要躺平」、問句（例如「沙發怎麼用？」）或一次說兩個指令都不會執行；說「停止」一定會停。",
             ))
             GuideCard("縮小 App 時", listOf(
-                "按主畫面鍵、切到其他 App、關螢幕或開啟 Spotify 時：停止按摩 → 回到沙發位置 → 下次設定恢復為 15 分鐘、力度 3。",
-                "通知列會顯示進度並有「停止」；沙發報錯或狀態不明時不會自動移動。",
-                "轉動手機或權限視窗不算縮小。",
+                "按主畫面鍵、切到其他 App、關螢幕或開啟 Spotify：沙發維持目前狀態，進行中的按摩或移動會照常完成。",
+                "通知列顯示沙發目前的狀態，並有「停止」。按住姿勢卡的移動會在離開時停止。",
+                "沙發沒有進行中的功能一分鐘後，App 會放開連線；切回 App 時自動重新連線，並顯示沙發目前的狀態。",
             ))
-            GuideCard("音樂", listOf("點「音樂（Spotify）」開啟 Spotify；在手機藍牙把沙發設為音訊輸出即可由沙發喇叭播放。"))
+            GuideCard("音樂", listOf("點「音樂」開啟 Spotify；在手機藍牙把沙發設為音訊輸出即可由沙發喇叭播放。"))
             GuideCard("安全提醒", listOf("移動前請確認沙發周圍與腳托下方淨空；異常時按「停止」或關閉沙發電源。"))
         }
         stopBar()

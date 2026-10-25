@@ -72,6 +72,10 @@ class MainActivity : ComponentActivity() {
         val actions = SofaActions(
             tapPosture = { controller.moveTo(it) },
             holdPosture = { p, down -> controller.hold(p, down) },
+            stopMove = { controller.stopMove() },
+            continueMove = { controller.continueMove() },
+            returnToOrigin = { controller.returnToOrigin() },
+            dismissInterrupted = { controller.dismissInterrupted() },
             startFullBody = { controller.startFullBody() },
             setWant30 = { controller.want30 = it },
             startManual = { controller.startManual() },
@@ -81,14 +85,13 @@ class MainActivity : ComponentActivity() {
             scan = { withBluetooth { conn.startAutoConnect() } },
             cancelConnect = { conn.cancel() },
             pick = { addr -> withBluetooth { conn.connectCandidate(addr) } },
-            disconnect = { conn.disconnect() },
+            disconnect = { controller.disconnect() },
             voice = { startVoice() },
             voiceCancel = { voice.cancel() },
             spotify = { launchSpotify() },
             enableBluetooth = { enableBluetooth() },
             grantPermissions = { btPermissions.launch(conn.requiredPermissions()) },
             openAppSettings = { openAppSettings() },
-            dismissReturnProblem = { controller.dismissReturnProblem() },
             copyDiagnostics = { copyDiagnostics() },
             setTranscripts = { on -> prefs.edit().putBoolean(KEY_TRANSCRIPTS, on).apply(); refreshEnv() },
             sendRaw = if (BuildConfig.DEBUG) { s -> OsimProtocol.parseHex(s)?.let { conn.sendRaw(it) } ?: toast("十六進位格式錯誤") } else null,
@@ -98,9 +101,13 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) {
             conn.log("VOICE 同音比對自我測試：做直→${parser.parse("做直")} 站停→${parser.parse("站停")} 殺發→${parser.parse("殺發")}")
             if (BuildConfig.DEBUG) intent.getStringExtra("demo")?.let { DemoStates.of(it) }?.let { conn.debugDemo(it); return }
-            if (!handleNfcIntent(intent) && conn.phase == SofaConnection.Phase.IDLE && conn.hasPermissions() &&
-                conn.bluetoothOn && prefs.contains(KEY_LAST_SERIAL)) {
-                conn.log("啟動時自動連線上次的沙發")
+            // Opening the app does not connect by itself (user decision 2026-10-25): only an NFC tap,
+            // the 搜尋 button, or coming back from another app while connected (the system may have
+            // ended the app meanwhile — reconnectAfterSwitch covers that cold start).
+            val nfcTap = handleNfcIntent(intent)
+            if (!nfcTap && controller.reconnectAfterSwitch() && conn.phase == SofaConnection.Phase.IDLE &&
+                conn.hasPermissions() && conn.bluetoothOn) {
+                conn.log("從其他 App 切回來，重新連線沙發")
                 conn.startAutoConnect()
             }
         }
@@ -277,6 +284,5 @@ class MainActivity : ComponentActivity() {
         const val SPOTIFY = "com.spotify.music"
         const val KEY_TRANSCRIPTS = "log_transcripts"
         const val KEY_ASKED_NOTIFICATIONS = "asked_notifications"
-        const val KEY_LAST_SERIAL = "last_serial"
     }
 }

@@ -7,12 +7,12 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** improve-plan M04 / S01: one policy for buttons, voice and the automatic flows. */
+/** improve-plan M04 / S01: one policy for buttons and voice. */
 class ControlPolicyTest {
 
     private val ok = SofaStatus(sofaPosition = true, footBackLimit = true)
-    private fun ctx(status: SofaStatus? = ok, age: Long? = 500, operable: Boolean = true, bg: Boolean = false, returning: Boolean = false) =
-        Context(operable, status, age, bg, returning)
+    private fun ctx(status: SofaStatus? = ok, age: Long? = 500, operable: Boolean = true, bg: Boolean = false) =
+        Context(operable, status, age, bg)
     private fun blocked(op: Op, c: Context) = ControlPolicy.check(op, c) is Verdict.Block
     private val userOps = listOf(Op.MOVE, Op.START_MASSAGE, Op.ADJUST, Op.RESUME)
 
@@ -22,7 +22,7 @@ class ControlPolicyTest {
     }
 
     @Test fun nothingElseRunsWithoutAnOperableLinkAndAStatus() {
-        for (op in userOps + Op.PAUSE + Op.BACKGROUND_RETURN) {
+        for (op in userOps + Op.PAUSE) {
             assertTrue(blocked(op, ctx(operable = false)))
             assertTrue(blocked(op, ctx(status = null, age = null)))
         }
@@ -37,18 +37,11 @@ class ControlPolicyTest {
         val c = ctx(status = ok.copy(errorCode = 18))
         for (op in userOps) assertTrue(op.name, blocked(op, c))
         assertTrue((ControlPolicy.check(Op.MOVE, c) as Verdict.Block).reason.contains("18"))
-        assertTrue(blocked(Op.BACKGROUND_RETURN, c))                 // no automatic move on a fault
         assertEquals(Verdict.Allow, ControlPolicy.check(Op.PAUSE, c))
     }
 
-    @Test fun inTheBackgroundOnlyTheReturnRuns() {
+    @Test fun nothingNewStartsInTheBackground() {
         for (op in userOps) assertTrue(blocked(op, ctx(bg = true)))
-        assertEquals(Verdict.Allow, ControlPolicy.check(Op.BACKGROUND_RETURN, ctx(bg = true)))
-    }
-
-    @Test fun whileReturningNewOperationsWaitForStop() {
-        assertTrue(blocked(Op.MOVE, ctx(returning = true)))
-        assertTrue(blocked(Op.START_MASSAGE, ctx(returning = true)))
     }
 
     @Test fun aHealthyFreshStatusAllows() {
