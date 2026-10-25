@@ -24,8 +24,9 @@ object SofaColors {
     val Sage = Color(0xFF8DB7A5)
     val Sky = Color(0xFF9FB4D8)
     val Coral = Color(0xFFE26D5A)
+    val CoralDeep = Color(0xFF3A1F1B)
     val Text = Color(0xFFF1EDE6)
-    val Muted = Color(0xFF9BA1A8)
+    val Muted = Color(0xFFA7ADB4)
     val Line = Color(0xFF2C323B)
 }
 
@@ -36,6 +37,8 @@ private val Scheme = darkColorScheme(
     onPrimaryContainer = SofaColors.OnChampagne,
     secondary = SofaColors.Sage,
     onSecondary = SofaColors.Ink,
+    secondaryContainer = SofaColors.SurfaceHigher,
+    onSecondaryContainer = SofaColors.Text,
     tertiary = SofaColors.Sky,
     onTertiary = SofaColors.Ink,
     background = SofaColors.Ink,
@@ -49,16 +52,17 @@ private val Scheme = darkColorScheme(
     onError = SofaColors.Ink,
 )
 
+/** Main information 16–20 sp; nothing the user must read is below 13 sp (improve-plan §4.4). */
 private val Type = Typography(
     displaySmall = TextStyle(fontSize = 34.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp),
     headlineMedium = TextStyle(fontSize = 26.sp, fontWeight = FontWeight.SemiBold),
     headlineSmall = TextStyle(fontSize = 22.sp, fontWeight = FontWeight.SemiBold),
-    titleLarge = TextStyle(fontSize = 19.sp, fontWeight = FontWeight.SemiBold),
-    titleMedium = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Medium),
-    bodyLarge = TextStyle(fontSize = 16.sp, lineHeight = 24.sp),
-    bodyMedium = TextStyle(fontSize = 14.sp, lineHeight = 21.sp),
-    labelLarge = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.Medium),
-    labelMedium = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.6.sp),
+    titleLarge = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold),
+    titleMedium = TextStyle(fontSize = 17.sp, fontWeight = FontWeight.Medium),
+    bodyLarge = TextStyle(fontSize = 17.sp, lineHeight = 25.sp),
+    bodyMedium = TextStyle(fontSize = 15.sp, lineHeight = 22.sp),
+    labelLarge = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.Medium),
+    labelMedium = TextStyle(fontSize = 13.sp, fontWeight = FontWeight.Medium, letterSpacing = 0.4.sp),
 )
 
 private val Shape = Shapes(

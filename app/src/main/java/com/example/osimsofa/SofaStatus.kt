@@ -1,6 +1,11 @@
 package com.example.osimsofa
 
+import com.example.osimsofa.OsimProtocol.Area
+import com.example.osimsofa.OsimProtocol.BackSpeed
+import com.example.osimsofa.OsimProtocol.FootSeat
+import com.example.osimsofa.OsimProtocol.Level
 import com.example.osimsofa.OsimProtocol.Posture
+import com.example.osimsofa.OsimProtocol.RollerWidth
 
 /**
  * One 27-byte uDiva4 status packet: `55 AA | seq echo | 15 00 | 06 D0 C5|CA | 17 status bytes | xor`.
@@ -32,6 +37,12 @@ data class SofaStatus(
     val ottoman: Boolean = false,
     val speedLow: Boolean = false,
     val speedHigh: Boolean = false,
+    /** Foot kneading / foot vibration / seat vibration as reported ([16], [18]; decode is [static]). */
+    val footKneading: Level = Level.OFF,
+    val footVibration: Level = Level.OFF,
+    val seatVibration: Level = Level.OFF,
+    /** Roller width bits of [10]; null when none is set (auto or not reported). */
+    val rollerWidth: RollerWidth? = null,
     val programNo: Int = 0,
     val elapsedMin: Int = 0,
 ) {
@@ -55,11 +66,22 @@ data class SofaStatus(
     /** Same as OSIM's massageRemainingTime: (15 or 30) minus elapsed minutes. */
     val remainingMin: Int get() = ((if (is30min) 30 else 15) - elapsedMin).coerceAtLeast(0)
 
+    val backSpeed: BackSpeed get() = when { speedHigh -> BackSpeed.HIGH; speedLow -> BackSpeed.LOW; else -> BackSpeed.AUTO }
+
+    fun intensity(a: Area): Int = when (a) {
+        Area.SHOULDER -> shoulderIntensity; Area.BACK -> backIntensity; Area.LUMBAR -> lumbarIntensity
+    }
+
+    fun level(f: FootSeat): Level = when (f) {
+        FootSeat.FOOT_KNEADING -> footKneading; FootSeat.FOOT_VIBRATION -> footVibration; FootSeat.SEAT_VIBRATION -> seatVibration
+    }
+
     /** The fields worth logging/showing; equal summaries mean nothing the user cares about changed. */
     fun summary(): String =
-        "pos=${posture?.zh ?: "—"} foot=${if (footFrontLimit) "front" else if (footBackLimit) "back" else "mid"} ottoman=$ottoman " +
+        "pos=${posture?.let { Names.short(it) } ?: "—"} foot=${if (footFrontLimit) "front" else if (footBackLimit) "back" else "mid"} ottoman=$ottoman " +
             "prog=$programNo paused=$paused 30min=$is30min " +
-            "int=$shoulderIntensity/$backIntensity/$lumbarIntensity knead=$kneading tap=$tapping err=$errorCode"
+            "int=$shoulderIntensity/$backIntensity/$lumbarIntensity knead=$kneading tap=$tapping " +
+            "fk=${footKneading.name} fv=${footVibration.name} sv=${seatVibration.name} err=$errorCode"
 
     companion object {
         const val LENGTH = 27
@@ -89,6 +111,14 @@ data class SofaStatus(
             22 to "控制面板異常",
         )
 
+        /** low / high / auto / auto-by-program bits of one foot or seat function. */
+        private fun level(bits: Int, low: Int, high: Int, auto: Int): Level = when {
+            bits and high != 0 -> Level.HIGH
+            bits and low != 0 -> Level.LOW
+            bits and auto != 0 -> Level.AUTO
+            else -> Level.OFF
+        }
+
         fun parse(b: ByteArray): SofaStatus? {
             if (b.size != LENGTH) return null
             val u = IntArray(b.size) { b[it].toInt() and 0xFF }
@@ -101,11 +131,20 @@ data class SofaStatus(
                 kneading = bit(9, 0x01), tapping = bit(9, 0x02),
                 rollerFull = bit(9, 0x04), rollerPartial = bit(9, 0x08), paused = bit(9, 0x40),
                 backrestLimit = bit(10, 0x08),
+                rollerWidth = when {
+                    bit(10, 0x20) -> RollerWidth.NARROW
+                    bit(10, 0x40) -> RollerWidth.MIDDLE
+                    bit(10, 0x80) -> RollerWidth.WIDE
+                    else -> null
+                },
                 errorCode = u[11] and 0x1F,
                 rollersHome = bit(12, 0x10), sofaPosition = bit(12, 0x20),
                 backIntensity = u[13] shr 4,
                 is30min = bit(15, 0x08), ottoman = bit(15, 0x04),
+                footKneading = level(u[16], low = 0x01, high = 0x02, auto = 0x0C),
+                footVibration = level(u[16], low = 0x10, high = 0x20, auto = 0xC0),
                 shoulderIntensity = u[17] shr 4, lumbarIntensity = u[17] and 0x0F,
+                seatVibration = level(u[18], low = 0x01, high = 0x02, auto = 0x0C),
                 footFrontLimit = bit(18, 0x10), speedHigh = bit(18, 0x20), speedLow = bit(18, 0x40),
                 footBackLimit = bit(19, 0x10), reclinePosition = bit(19, 0x40), uprightPosition = bit(19, 0x80),
                 programNo = u[20],

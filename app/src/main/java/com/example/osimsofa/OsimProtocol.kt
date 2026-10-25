@@ -68,10 +68,9 @@ object OsimProtocol {
         const val SEAT_VIBRATION = 0x23
     }
 
-    /** The sofa's three preset positions (OSIM: sofa / upright / reclined — there is no zero-g). */
-    enum class Posture(val key: Int, val zh: String) {
-        UPRIGHT(Key.UPRIGHT, "坐直"), RECLINE(Key.RECLINE, "躺平"), SOFA(Key.SOFA, "沙發")
-    }
+    /** The sofa's three preset positions (OSIM: sofa / upright / reclined — there is no zero-g).
+     *  What the app calls them is in [Names]. */
+    enum class Posture(val key: Int) { UPRIGHT(Key.UPRIGHT), RECLINE(Key.RECLINE), SOFA(Key.SOFA) }
 
     /** uDiva4 auto programs: the status reports [number], the start key is number + 0x23.
      *  [prepare] is the position OSIM moves the sofa to before starting. */
@@ -95,34 +94,68 @@ object OsimProtocol {
     enum class Rolling(val wire: Int, val zh: String) { OFF(0, "關"), FULL(1, "全程"), PARTIAL(2, "局部") }
     enum class BackSpeed(val wire: Int, val zh: String) { AUTO(1, "自動"), LOW(2, "慢"), HIGH(3, "快") }
     enum class RollerWidth(val wire: Int, val zh: String) { NARROW(1, "窄"), MIDDLE(2, "中"), WIDE(3, "寬"), AUTO(4, "自動") }
-    /** Foot kneading, foot vibration and seat (butt) vibration share these values. */
+    /** Foot kneading, foot vibration and seat (butt) vibration share these values. Note the wire
+     *  value 3 means 弱 here — it is not the 1–5 intensity of shoulder/back/lumbar. */
     enum class Level(val wire: Int, val zh: String) { OFF(0, "關"), AUTO(2, "自動"), LOW(3, "弱"), HIGH(4, "強") }
     val INTENSITY = 1..5
+
+    enum class Area(val key: Int) {
+        SHOULDER(Key.SHOULDER_INTENSITY), BACK(Key.BACK_INTENSITY), LUMBAR(Key.LUMBAR_INTENSITY)
+    }
+
+    enum class FootSeat(val key: Int) {
+        FOOT_KNEADING(Key.FOOT_KNEADING), FOOT_VIBRATION(Key.FOOT_VIBRATION), SEAT_VIBRATION(Key.SEAT_VIBRATION)
+    }
+
+    /** The settings a new session starts with (improve-plan §5.3: one source for the button, voice
+     *  and the reset after the background return). */
+    enum class AutoProfile(val shoulder: Int, val back: Int, val lumbar: Int, val zh: String) {
+        LEVEL3(3, 3, 3, "力度 3・其餘自動");
+
+        fun intensity(a: Area): Int = when (a) { Area.SHOULDER -> shoulder; Area.BACK -> back; Area.LUMBAR -> lumbar }
+    }
 
     data class ManualSettings(
         val kneadTap: KneadTap = KneadTap.KNEADING,
         val rolling: Rolling = Rolling.FULL,
         val speed: BackSpeed = BackSpeed.AUTO,
         val width: RollerWidth = RollerWidth.AUTO,
-        val shoulder: Int = 3,
-        val back: Int = 3,
-        val lumbar: Int = 3,
-        val footKneading: Level = Level.OFF,
-        val footVibration: Level = Level.OFF,
-        val seatVibration: Level = Level.OFF,
-    )
+        val shoulder: Int = AutoProfile.LEVEL3.shoulder,
+        val back: Int = AutoProfile.LEVEL3.back,
+        val lumbar: Int = AutoProfile.LEVEL3.lumbar,
+        val footKneading: Level = Level.AUTO,
+        val footVibration: Level = Level.AUTO,
+        val seatVibration: Level = Level.AUTO,
+    ) {
+        fun intensity(a: Area): Int = when (a) { Area.SHOULDER -> shoulder; Area.BACK -> back; Area.LUMBAR -> lumbar }
+        fun withIntensity(a: Area, v: Int): ManualSettings = when (a) {
+            Area.SHOULDER -> copy(shoulder = v); Area.BACK -> copy(back = v); Area.LUMBAR -> copy(lumbar = v)
+        }
+        fun level(f: FootSeat): Level = when (f) {
+            FootSeat.FOOT_KNEADING -> footKneading; FootSeat.FOOT_VIBRATION -> footVibration; FootSeat.SEAT_VIBRATION -> seatVibration
+        }
+        fun withLevel(f: FootSeat, l: Level): ManualSettings = when (f) {
+            FootSeat.FOOT_KNEADING -> copy(footKneading = l)
+            FootSeat.FOOT_VIBRATION -> copy(footVibration = l)
+            FootSeat.SEAT_VIBRATION -> copy(seatVibration = l)
+        }
+
+        companion object { val DEFAULTS = ManualSettings() }
+    }
 
     /** One mainboard command = OSIM's CommandModel: header (`C5 00` for key operations) + values.
-     *  Its frame (and sequence number) is built when it is sent. */
-    data class Cmd(val label: String, val values: List<Int>, val header: List<Int> = KEY_OP) {
+     *  Its frame (and sequence number) is built when it is sent. [retry] = false for a command that
+     *  must never be sent twice by accident (the 15↔30 toggle): no re-send when the ack is late. */
+    data class Cmd(val label: String, val values: List<Int>, val header: List<Int> = KEY_OP, val retry: Boolean = true) {
+        val isKeyOp: Boolean get() = header == KEY_OP
         /** The key code for a key operation, null for other headers. */
-        val key: Int? get() = if (header == KEY_OP) values.firstOrNull() else null
+        val key: Int? get() = if (isKeyOp) values.firstOrNull() else null
         fun frame(seq: Int = nextSeq()): ByteArray = mbFrame(header.toBytes(), values.toBytes(), seq)
     }
 
     private val KEY_OP = listOf(0xC5, 0x00)
     private fun List<Int>.toBytes() = ByteArray(size) { this[it].toByte() }
-    private fun key(k: Int, p1: Int = 0, label: String) = Cmd(label, listOf(k, p1, 0))
+    private fun key(k: Int, p1: Int = 0, label: String, retry: Boolean = true) = Cmd(label, listOf(k, p1, 0), retry = retry)
 
     // ====== command sequences (mirror UDiva4ChairController / UDiva4ManualMassageHelper) ===========
     /** What OSIM sends right after connecting (initMb), before any key operation: two read-only queries. */
@@ -132,16 +165,42 @@ object OsimProtocol {
     )
     fun release() = key(Key.KEY_OFF, label = "放開")
     fun heartbeat() = key(Key.KEY_OFF, label = "心跳")
-    fun hold(p: Posture) = key(p.key, label = p.zh)
+    fun hold(p: Posture) = key(p.key, label = Names.short(p))
     fun pause() = key(Key.PAUSE, label = "暫停")
     fun resume() = key(Key.RESUME, label = "繼續")
     fun stopMassage() = key(Key.STOP_MASSAGE, label = "停止按摩")
 
-    /** OSIM's startAutoMassage: toggle 15/30 min only if the sofa isn't already on it, then start. */
+    /** 15 ↔ 30 min. A toggle sent twice undoes itself, so it is never re-sent on a late ack; the
+     *  caller confirms the result from the next status instead. */
+    fun toggleDuration() = key(Key.TOGGLE_DURATION, label = "切換按摩時間", retry = false)
+
+    fun startProgram(p: AutoProgram) = key(p.startKey, label = "啟動${p.zh}")
+
+    /** OSIM's startAutoMassage before the start key: toggle only if the sofa reports the other duration. */
     fun startProgram(p: AutoProgram, is30min: Boolean?, want30: Boolean): List<Cmd> {
-        val toggle = if (is30min != null && is30min != want30) listOf(key(Key.TOGGLE_DURATION, label = "切換按摩時間")) else emptyList()
-        return toggle + key(p.startKey, label = "啟動${p.zh}")
+        val toggle = if (is30min != null && is30min != want30) listOf(toggleDuration()) else emptyList()
+        return toggle + startProgram(p)
     }
+
+    /** What OSIM sends once an auto program runs (startAutoMassage's UDiva4AutoMassageCommand list, same
+     *  order, no keyOff in between): shoulder, back, lumbar intensity, then foot vibration, seat (butt)
+     *  vibration and foot kneading — in an auto program these three are only on (AUTO = 2) or off (0). */
+    fun autoProgramSettings(profile: AutoProfile): List<Cmd> = listOf(
+        intensity(Area.SHOULDER, profile.shoulder),
+        intensity(Area.BACK, profile.back),
+        intensity(Area.LUMBAR, profile.lumbar),
+        footSeat(FootSeat.FOOT_VIBRATION, Level.AUTO),
+        footSeat(FootSeat.SEAT_VIBRATION, Level.AUTO),
+        footSeat(FootSeat.FOOT_KNEADING, Level.AUTO),
+    )
+
+    /** One intensity change (auto program: sent on its own, like OSIM's adjustShoulderIntensity…). */
+    fun intensity(a: Area, level: Int): Cmd {
+        val v = level.coerceIn(INTENSITY)
+        return key(a.key, v, "${Names.area(a)}力度 $v")
+    }
+
+    fun footSeat(f: FootSeat, l: Level): Cmd = key(f.key, l.wire, "${Names.function(f)} ${l.zh}")
 
     /** A manual setting is pressed then released, exactly like OSIM's presetCommands. */
     private fun setting(k: Int, value: Int, label: String) = listOf(key(k, value, label), release())
@@ -201,6 +260,15 @@ object OsimProtocol {
     fun isReply(b: ByteArray): Boolean =
         b.size >= 9 && (b[0].toInt() and 0xFF) == 0x55 && (b[1].toInt() and 0xFF) == 0xAA &&
             !((b[7].toInt() and 0xFF) == 0xD0 && (b[8].toInt() and 0xFF) == 0xCA)
+
+    /** The sequence number a reply echoes (every captured C5 reply carries the seq of the frame it
+     *  answers, 249/249), or null for anything that is not a reply. */
+    fun replySeq(b: ByteArray): Int? =
+        if (isReply(b)) (b[2].toInt() and 0xFF) or ((b[3].toInt() and 0xFF) shl 8) else null
+
+    /** A reply to a key operation (`D0 C5`), as opposed to the answers to C2/C6 queries. */
+    fun isKeyReply(b: ByteArray): Boolean =
+        isReply(b) && (b[7].toInt() and 0xFF) == 0xD0 && (b[8].toInt() and 0xFF) == 0xC5
 
     /** Verified CDC volume frame: E0 A1 <vol 0..100> 01 <xor>. */
     fun volumeFrame(volPercent: Int): ByteArray {

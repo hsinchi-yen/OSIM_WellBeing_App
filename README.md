@@ -1,46 +1,76 @@
-# uDiva Sofa Control (clean-room Kotlin app)
+# uDiva 沙發（clean-room Android app）
 
-A minimal, single-purpose Android app to control the **OSIM uDiva SOFA** (internal model
-UDiva4) over Bluetooth LE — no OSIM cloud, account, health, or shopping. Built from the
-reverse-engineered BLE protocol, not from OSIM's app code.
+Controls an **OSIM uDiva SOFA** (internal model uDiva4) over Bluetooth LE — no OSIM cloud, account,
+health or shopping. Kotlin + Jetpack Compose, Traditional Chinese UI, built from the
+reverse-engineered protocol in `../findings/PROTOCOL.md` (not from OSIM's code).
 
-## Status: v0.1 (installable, testable)
-Working now:
-- **BLE scan / connect / GATT dump** — finds the sofa (★ marks likely matches), connects, and
-  lists every service + characteristic so we confirm the live control service/characteristics.
-- **Notifications + raw hex write** — enable notifications and send arbitrary command bytes to
-  the write characteristic (also lets the phone itself verify/capture the protocol).
-- **NFC tap** — reads the sofa's NDEF tag and parses the product serial.
-- **Spotify launch** — opens Spotify (audio plays through the sofa once A2DP is paired).
-- **zh-TW voice** — SpeechRecognizer (cmn-Hant-TW) + TextToSpeech; maps spoken commands to actions.
+## v0.4.0 — what it does
 
-Pending the confirmed command bytes (from Blutter static recovery or a BLE capture):
-- The **Sofa / Programs / Control** buttons and voice actions are wired through `OsimProtocol`.
-  Until the command table is loaded they report "pending protocol" instead of sending unverified
-  bytes. Once `OsimProtocol.loadCommandTable(...)` is populated, they work immediately.
+| Area | Behaviour |
+|---|---|
+| Connect | Auto-connects the last sofa on launch. NFC tap: the tapped sofa if its tag serial is in a Bluetooth name, otherwise the last / only sofa module nearby (the tag may hold the product serial, and one sofa has two modules). Several unknown modules → you pick. "Operable" only after the first valid status. |
+| Postures | 坐式／躺平／沙發（待機）. **Tap**: moves until the sofa reports the preset (watchdog 40 s). **Hold**: moves only while held. 沙發（待機） stops the massage first. |
+| 全身按摩 | 15 or 30 min (screen chips or voice). Moves to 躺平, confirms arrival, sets the duration (toggle only if needed, never re-sent), starts Signature, waits for program 16, then applies AutoLevel3 (shoulder/back/lumbar 3, foot/seat AUTO). |
+| 手動按摩 | Back / foot / seat groups; changes go out at once while manual runs, otherwise apply at the next start. |
+| Stop | Bottom bar, voice or notification. Pre-empts the frame in flight and any retries; nothing restarts by itself. |
+| Minimise | Home / other app / screen off / Spotify → stop massage → back to the sofa preset → reset next-session defaults (15 min, AutoLevel3). Not on a fault or a stale status. Foreground service with a 停止 action. |
+| Voice | One tap = one recognition. Parameters (15/30 min, areas, foot/seat functions); negations, questions, two commands at once and unsupported durations never run anything. Homophones by pinyin (Android 10+). Word list: `../dist/VOICE-COMMANDS.md`. |
+| Faults | Fault card on top (code, meaning, OSIM's advice); no movement or massage start while the sofa reports one. |
+| Diagnostics | Read-only, with a masked copy-to-clipboard; raw hex writing only in debug builds; voice transcripts only logged when switched on. |
 
-## Install
-Option A (adb): approve the "Allow USB debugging" prompt on the phone, then:
+## Structure
+
 ```
-adb install -r dist/uDiva-Sofa-Control-v0.1-debug.apk
+ui/Screens.kt        Compose screens (connect, control, guide, diagnostics)
+MainActivity         permissions, NFC, voice input, Spotify — no sofa state
+SofaApplication      owns the session for the process; app-minimised detection
+SofaService          connectedDevice foreground service + notification Stop
+SofaController       every operation: policy → flow → link; user-facing events
+ControlPolicy        operable / fresh status / fault / background / returning
+MoveToTarget         one preset move (HOLD or AUTO), ends on the sofa's "reached" bit
+FullBodySession      全身按摩 15/30 min with AutoLevel3, every wait bounded
+ReturnToSofaFlow     the minimise flow
+MbLink               mainboard write discipline (acks by seq, retries, stream, Stop pre-emption)
+SofaConnection       BLE scan/connect/MTU/notify, connection generations, timeouts
+OsimProtocol / SofaStatus   frames, key codes, status decoding
+VoiceParser          speech → VoiceCommand (or a reason not to act)
+Vocabulary (Names)   the names used on screen, in replies and in the notification
 ```
-Option B (sideload): copy the APK in `dist/` to the phone and open it (allow install from this
-source). Grant Bluetooth, Location (on tap), and Microphone permissions when asked.
 
-## Build from source
-Requires the Android SDK (platforms;android-35, build-tools;35.0.0) and JDK 17.
+The flows, the policy, the parser and `MbLink` are pure Kotlin and unit-tested on the JVM.
+
+## Build and test
+
+JDK 17 and the Android SDK (platform 35, build-tools 35.0.0); `local.properties` points `sdk.dir` at it.
+
 ```
-cd osim-sofa-app
-<gradle-8.7>/bin/gradle --no-daemon assembleDebug
+./gradlew testDebugUnitTest lintDebug assembleDebug      # or ../tools/gradle-8.7/bin/gradle …
 # APK: app/build/outputs/apk/debug/app-debug.apk
 ```
-`local.properties` points `sdk.dir` at the Android SDK.
 
-## How to use for protocol capture
-1. Power the sofa on; Scan; tap the ★ device to connect; watch the GATT dump in the log.
-2. Tap **Enable notify**, then drive the real OSIM app for each function while this app is
-   connected — or send candidate bytes via **Send hex** and watch the sofa + the RX log.
-3. Share the log; confirmed bytes get baked into `OsimProtocol` for the next build.
+On the development PC the JDK's download of lint's 55 MB `kotlin-compiler-31.6.0.jar` fails with
+"Tag mismatch!"; that file was fetched with curl, checked against Google's `.sha1`, and is served
+from `../tools/m2-local` by an init script:
+
+```
+../tools/gradle-8.7/bin/gradle --init-script ../tools/gradle-init/local-m2.init.gradle.kts lintDebug
+```
+
+Unit tests replay the real OSIM capture in `app/src/test/resources/capture_mb.txt` (251 key frames,
+261 status packets) and run the flows on a fake clock. Lint has no errors; its warnings (targetSdk
+not the newest, newer AndroidX versions, `mipmap-anydpi-v26`) are deliberate for this release.
+
+## Install
+
+```
+adb install -r ../dist/uDiva-Sofa-Control-v0.4.0-debug.apk
+```
+
+Then follow `../dist/HOW-TO-TEST.md`.
 
 ## Safety
-The sofa has motors. Only send bytes confirmed from a capture; keep a hand on the physical stop.
+
+The sofa has motors. The app sends only commands confirmed from OSIM's app and capture. Moves stop
+on the sofa's own arrival report, on release (hold), on Stop, on a fault, when the status goes stale
+or the link drops, and at the latest after the watchdog. Keep the space around the sofa and under the
+footrest clear; the sofa's power switch is the last resort.

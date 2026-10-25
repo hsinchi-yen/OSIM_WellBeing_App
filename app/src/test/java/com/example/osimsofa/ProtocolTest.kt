@@ -140,7 +140,57 @@ class ProtocolTest {
         assertEquals(1, sent[Key.BACK_SPEED])         // auto
         assertEquals(4, sent[Key.ROLLER_WIDTH])       // auto
         assertEquals(3, sent[Key.BACK_INTENSITY])
-        assertEquals(0, sent[Key.FOOT_VIBRATION])     // off
+        assertEquals(2, sent[Key.FOOT_VIBRATION])     // AutoLevel3: foot / seat on AUTO
+        assertEquals(2, sent[Key.SEAT_VIBRATION])
+        assertEquals(2, sent[Key.FOOT_KNEADING])
+    }
+
+    @Test fun everyReplyEchoesTheSequenceOfTheFrameItAnswers() {
+        var lastTx: Int? = null
+        var matched = 0
+        for ((kind, f) in capture) {
+            if (kind == "TX" || kind == "INIT") { lastTx = seqOf(f); continue }
+            val seq = OsimProtocol.replySeq(f)
+            if (u(f, 8) == 0xCA) { assertNull(seq); continue }        // a report answers nothing
+            assertEquals(OsimProtocol.hex(f), lastTx, seq)
+            assertTrue(OsimProtocol.isKeyReply(f))
+            matched++
+        }
+        assertEquals(249, matched)
+    }
+
+    @Test fun autoProgramSettingsAreOsimsPostStartList() {
+        val cmds = OsimProtocol.autoProgramSettings(OsimProtocol.AutoProfile.LEVEL3)
+        assertEquals(listOf(Key.SHOULDER_INTENSITY, Key.BACK_INTENSITY, Key.LUMBAR_INTENSITY,
+            Key.FOOT_VIBRATION, Key.SEAT_VIBRATION, Key.FOOT_KNEADING), cmds.map { it.key })
+        assertEquals(listOf(3, 3, 3, 2, 2, 2), cmds.map { it.values[1] })
+        assertTrue(cmds.none { it.key == Key.KEY_OFF })                // sent back to back, like OSIM
+        // AA^55^07^00^06^00^C5^00^44^03^00 = 0x7C
+        assertEquals("aa 55 07 00 06 00 c5 00 44 03 00 7c", OsimProtocol.hex(cmds.first().frame(seq = 7)))
+    }
+
+    @Test fun theDurationToggleIsTheOnlyCommandNeverRetried() {
+        assertFalse(OsimProtocol.toggleDuration().retry)
+        assertTrue(OsimProtocol.startProgram(AutoProgram.SIGNATURE).retry)
+        assertTrue(OsimProtocol.stopMassage().retry)
+    }
+
+    @Test fun footAndSeatLevelsDecode() {
+        val p = frames("RX").first().copyOf()
+        p[16] = 0x24                                                    // foot kneading auto · foot vibration high
+        p[18] = ((p[18].toInt() and 0xF0) or 0x01).toByte()            // seat vibration low
+        p[26] = OsimProtocol.xor(p, 26).toByte()
+        val s = SofaStatus.parse(p)!!
+        assertEquals(Level.AUTO, s.footKneading)
+        assertEquals(Level.HIGH, s.footVibration)
+        assertEquals(Level.LOW, s.seatVibration)
+    }
+
+    @Test fun theAppNamesThePresetsAsConfirmed() {
+        assertEquals("坐式", Names.label(Posture.UPRIGHT))
+        assertEquals("躺平", Names.label(Posture.RECLINE))
+        assertEquals("沙發（待機）", Names.label(Posture.SOFA))
+        assertEquals("全身按摩 30 分鐘・力度 3・其餘自動", Names.fullBody(30))
     }
 
     @Test fun manualChangeSendsOnlyWhatChanged() {

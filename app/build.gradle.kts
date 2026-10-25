@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.osimsofa"
         minSdk = 27
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.3"
+        versionCode = 14
+        versionName = "0.4.0"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -24,6 +24,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true   // BuildConfig.DEBUG gates the raw hex writer (test builds only)
     }
     composeOptions {
         // Matches Kotlin 1.9.24
@@ -48,6 +49,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
+    implementation("androidx.lifecycle:lifecycle-process:2.8.3")   // "app minimised" = no Activity visible
     implementation("androidx.core:core-ktx:1.13.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
