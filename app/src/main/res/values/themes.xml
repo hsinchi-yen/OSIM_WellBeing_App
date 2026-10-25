@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Edge-to-edge dark base; all real styling is done in Compose (ui/Theme.kt). -->
+    <style name="Theme.UDivaSofa" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0E1013</item>
+        <item name="android:statusBarColor">#0E1013</item>
+        <item name="android:navigationBarColor">#0E1013</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
