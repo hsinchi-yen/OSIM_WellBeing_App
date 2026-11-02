@@ -14,6 +14,7 @@ import android.nfc.NdefMessage
 import android.nfc.NfcAdapter
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -40,6 +41,7 @@ class MainActivity : ComponentActivity() {
     private val prefs by lazy { getSharedPreferences("sofa", MODE_PRIVATE) }
     private lateinit var voice: VoiceInput
     private val parser by lazy { VoiceParser(platformPinyin()) }
+    private val voiceMemory = VoiceMemory()
     private var nfc: NfcAdapter? = null
     private var env by mutableStateOf(UiEnv())
 
@@ -65,7 +67,7 @@ class MainActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
-        voice = VoiceInput(this, ::onVoiceResult)
+        voice = VoiceInput(this, ::onVoiceResult, ::onVoicePartial)
         nfc = NfcAdapter.getDefaultAdapter(this)
         refreshEnv()
 
@@ -80,6 +82,9 @@ class MainActivity : ComponentActivity() {
             setWant30 = { controller.want30 = it },
             startManual = { controller.startManual() },
             changeManual = { controller.changeManual(it) },
+            setIntensity = { area, level -> controller.setIntensity(area, level) },
+            setFunction = { f, level -> controller.setFunction(f, level) },
+            focusZone = { controller.focus(it) },
             pauseOrResume = { controller.pauseOrResume() },
             stop = { voice.cancel(); controller.stopAll() },
             scan = { withBluetooth { conn.startAutoConnect() } },
@@ -116,7 +121,23 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (debugSay(intent)) return
         handleNfcIntent(intent)
+    }
+
+    /**
+     * Debug builds, demo mode only: run text through the voice path as if it had been heard, to
+     * check it on an emulator (no microphone). Demo mode keeps the link closed, so nothing can reach
+     * a sofa; never widen this to a real connection — movement is not triggered from a PC.
+     *
+     *     adb shell am start -n com.example.osimsofa/.MainActivity --es say 腰部按摩
+     */
+    private fun debugSay(intent: Intent?): Boolean {
+        if (!BuildConfig.DEBUG || !conn.demo) return false
+        val said = intent?.getStringExtra("say") ?: return false
+        voiceEpoch = controller.stopEpoch
+        onVoiceResult(listOf(said), null)
+        return true
     }
 
     override fun onResume() {
@@ -223,6 +244,15 @@ class MainActivity : ComponentActivity() {
         voice.listen()
     }
 
+    /** 「停止」 in the middle of a sentence: the sofa need not wait for the sentence to end. */
+    private fun onVoicePartial(text: String) {
+        if (controller.stopEpoch != voiceEpoch || !parser.earlyStop(text)) return
+        conn.log("VOICE 聆聽中聽到停止")
+        voice.finishEarly("聽到「$text」\n理解為：${VoiceParser.describe(VoiceCommand.StopAll)}")
+        controller.execute(VoiceCommand.StopAll)
+        voiceMemory.remember(VoiceCommand.StopAll, SystemClock.uptimeMillis())
+    }
+
     private fun onVoiceResult(candidates: List<String>, confidence: FloatArray?) {
         if (controller.stopEpoch != voiceEpoch) {
             conn.log("VOICE 聆聽期間按了停止，這次不執行")
@@ -231,11 +261,15 @@ class MainActivity : ComponentActivity() {
         }
         val d = parser.decide(candidates, confidence)
         if (prefs.getBoolean(KEY_TRANSCRIPTS, false)) conn.log("VOICE 聽到 ${candidates.joinToString("／")} → $d")
-        else conn.log("VOICE 決定：${d::class.simpleName}" + if (d is VoiceDecision.Run) " ${VoiceParser.describe(d.cmd)}" else "")
+        else conn.log("VOICE 決定：${d::class.simpleName}" +
+            if (d is VoiceDecision.Run) " ${VoiceParser.describe(voiceMemory.resolve(d.cmd, SystemClock.uptimeMillis()))}" else "")
         when (d) {
             is VoiceDecision.Run -> {
-                voice.done("聽到「${d.heard}」\n理解為：${VoiceParser.describe(d.cmd)}")
-                controller.execute(d.cmd)
+                val now = SystemClock.uptimeMillis()
+                val cmd = voiceMemory.resolve(d.cmd, now)
+                voice.done("聽到「${d.heard}」\n理解為：${VoiceParser.describe(cmd)}")
+                controller.execute(cmd)
+                voiceMemory.remember(cmd, now)
                 d.note?.let { app.speaker.say(it) }
             }
             is VoiceDecision.Ask -> { voice.fail("聽到「${d.heard}」\n${d.message}"); app.speaker.say(d.message) }

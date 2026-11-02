@@ -14,9 +14,12 @@ import com.example.osimsofa.OsimProtocol.Area
 import com.example.osimsofa.OsimProtocol.AutoProgram
 import com.example.osimsofa.OsimProtocol.BackSpeed
 import com.example.osimsofa.OsimProtocol.FootSeat
+import com.example.osimsofa.OsimProtocol.KneadTap
 import com.example.osimsofa.OsimProtocol.Level
 import com.example.osimsofa.OsimProtocol.ManualSettings
 import com.example.osimsofa.OsimProtocol.Posture
+import com.example.osimsofa.OsimProtocol.RollerWidth
+import com.example.osimsofa.OsimProtocol.Rolling
 
 /**
  * What the buttons, voice and the notification do (improve-plan §8). Every operation passes
@@ -36,6 +39,8 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
     data class SessionView(val minutes: Int, val stage: FullBodySession.Stage, val failure: String?, val confirmed: Boolean?)
     /** A tap move that stopped on the way: offer to finish it, or to go back to where it began. */
     data class Interrupted(val target: Posture, val origin: Posture?)
+    /** [nonce]: the same zone named twice still counts as a new request. */
+    data class Spotlight(val zone: Zone, val nonce: Int)
 
     /** The preset being moved to right now, if any. */
     var moving by mutableStateOf<MoveView?>(null); private set
@@ -47,6 +52,8 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
     /** Settings for the next manual massage (and the running one, while manual runs). */
     var manual by mutableStateOf(ManualSettings.DEFAULTS); private set
     var inBackground by mutableStateOf(false); private set
+    /** The zone a voice command just acted on, so the screen can show it. */
+    var spotlight by mutableStateOf<Spotlight?>(null); private set
 
     /** Every user-facing outcome (spoken by the app, mirrored in the notification). */
     var onEvent: ((UserEvent) -> Unit)? = null
@@ -195,6 +202,7 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
 
     fun startManual(source: Source = Source.BUTTON) {
         if (!allowed(Op.START_MASSAGE)) return
+        if (!manual.anyOn()) { report("所有部位都是關閉的；請先開啟一個部位", speak = source == Source.VOICE, problem = true); return }
         mover?.let { if (it.active) apply(it.cancel(now())) }
         mover = null
         cancelPreparation()
@@ -212,10 +220,51 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         if (conn.status?.programNo == OsimProtocol.MANUAL_PROGRAM_NO) {
             if (!allowed(Op.ADJUST)) return
             manual = next
+            if (!next.anyOn()) {           // nothing left to run: end it, not a silent empty massage
+                report("已關閉所有部位", speak = false)
+                stopAll(if (fromVoice) Source.VOICE else Source.BUTTON)
+                return
+            }
             conn.enqueue(OsimProtocol.manualChanges(prev, next))
             report("已送出手動按摩調整", speak = false)
         } else {
             manual = next
+        }
+    }
+
+    /** One intensity, from the zone panel: follows what runs, like a voice adjustment. */
+    fun setIntensity(a: Area, level: Int) = adjustIntensity(setOf(a)) { level }
+
+    /** One foot or seat function, from the zone panel. */
+    fun setFunction(f: FootSeat, level: Level) = function(listOf(f), level)
+
+    /**
+     * 「腰部按摩」 or the zone panel's button. From idle only this zone runs, if the sofa is in a
+     * position for it (the app does not move it for this); a running manual massage shifts towards
+     * the zone; an auto program has its own plan and is left alone.
+     */
+    fun focus(z: Zone, source: Source = Source.BUTTON) {
+        if (!allowed(Op.START_MASSAGE)) return
+        val s = conn.status ?: return
+        val say = source == Source.VOICE
+        when {
+            s.programNo == OsimProtocol.MANUAL_PROGRAM_NO -> {
+                val next = ZoneFocus.emphasise(manual, z)
+                if (next == manual) { report("手動按摩已包含${z.zh}", speak = say); return }
+                conn.enqueue(OsimProtocol.manualChanges(manual, next))
+                manual = next
+                report("已加強${z.zh}按摩", speak = say)
+                afterStep()
+            }
+            // The foot and seat are extras an auto program can take; its rollers follow its own plan.
+            running(s) == Running.AUTO && z == Zone.LEGS -> function(listOf(FootSeat.FOOT_KNEADING, FootSeat.FOOT_VIBRATION), Level.AUTO)
+            running(s) == Running.AUTO && z == Zone.SEAT -> function(listOf(FootSeat.SEAT_VIBRATION), Level.AUTO)
+            s.massageRunning -> report("目前的按摩程式進行中；要改成${z.zh}按摩，請先停止", speak = say)
+            else -> {
+                ZoneFocus.blocked(z, s)?.let { report(it, speak = say, problem = true); return }
+                manual = ZoneFocus.solo(manual, z)
+                startManual(source)
+            }
         }
     }
 
@@ -295,13 +344,35 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
                 VoiceCommand.Pause -> pause(Source.VOICE)
                 VoiceCommand.Resume -> resume(Source.VOICE)
                 VoiceCommand.StopAll -> stopAll(Source.VOICE)
-                is VoiceCommand.Intensity -> intensity(cmd.delta, cmd.areas.ifEmpty { Area.entries.toSet() })
+                is VoiceCommand.Intensity -> {
+                    val areas = cmd.areas.ifEmpty { Area.entries.toSet() }
+                    adjustIntensity(areas) { (it + cmd.delta).coerceIn(OsimProtocol.INTENSITY) }
+                    if (areas.size == 1) show(Zone.of(areas.single()))
+                }
+                is VoiceCommand.SetIntensity -> {
+                    val areas = cmd.areas.ifEmpty { Area.entries.toSet() }
+                    adjustIntensity(areas) { cmd.level }
+                    if (areas.size == 1) show(Zone.of(areas.single()))
+                }
                 is VoiceCommand.Speed -> speed(cmd.faster)
-                is VoiceCommand.SetFunction -> function(cmd.function, cmd.level)
+                is VoiceCommand.SetFunction -> {
+                    function(listOf(cmd.function), cmd.level)
+                    show(if (cmd.function == FootSeat.SEAT_VIBRATION) Zone.SEAT else Zone.LEGS)
+                }
+                is VoiceCommand.LegMassage -> { function(listOf(FootSeat.FOOT_KNEADING, FootSeat.FOOT_VIBRATION), cmd.level); show(Zone.LEGS) }
+                is VoiceCommand.Focus -> { focus(cmd.zone, Source.VOICE); show(cmd.zone) }
+                VoiceCommand.BackOff -> backOff()
+                is VoiceCommand.Technique -> rollers("手法${cmd.kneadTap.zh}") { copy(kneadTap = cmd.kneadTap) }
+                is VoiceCommand.Roll -> rollers("${cmd.rolling.zh}滾動") { copy(rolling = cmd.rolling) }
+                is VoiceCommand.Width -> rollers(if (cmd.wider) "滾輪調寬" else "滾輪調窄") { copy(width = nextWidth(width, cmd.wider)) }
+                is VoiceCommand.Query -> answer(cmd.topic)
             }
         } finally { fromVoice = false }
     }
     private var fromVoice = false
+    private var spotlightCount = 0
+
+    private fun show(z: Zone) { spotlight = Spotlight(z, ++spotlightCount) }
 
     private enum class Running { NONE, MANUAL, AUTO }
 
@@ -311,16 +382,22 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         else -> Running.NONE
     }
 
-    private fun intensity(delta: Int, areas: Set<Area>) {
+    /** The level [next] asks for on each area, sent the way the running massage takes it. */
+    private fun adjustIntensity(areas: Set<Area>, next: (Int) -> Int) {
         if (!allowed(Op.ADJUST)) return
         val s = conn.status ?: return
         val r = running(s)
         // An auto program is adjusted from what the sofa reports; manual and "next time" from our settings.
         val base: (Area) -> Int = if (r == Running.AUTO) { a -> s.intensity(a) } else { a -> manual.intensity(a) }
-        val target = areas.associateWith { (base(it) + delta).coerceIn(OsimProtocol.INTENSITY) }
+        val target = areas.associateWith { next(base(it)).coerceIn(OsimProtocol.INTENSITY) }
         val where = if (areas.size == Area.entries.size) "肩、背、腰" else areas.joinToString("、") { Names.area(it) }
         if (target.all { (a, v) -> v == base(a) }) {
-            report(if (delta > 0) "${where}力度已是最強（5）" else "${where}力度已是最弱（1）"); return
+            if (fromVoice) report(when (target.values.distinct().singleOrNull()) {
+                OsimProtocol.INTENSITY.last -> "${where}力度已是最強（5）"
+                OsimProtocol.INTENSITY.first -> "${where}力度已是最弱（1）"
+                else -> "${where}力度沒有變更"
+            })
+            return
         }
         val levels = target.values.distinct().joinToString("／")
         when (r) {
@@ -330,17 +407,76 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
                 expect("${where}力度已調為 $levels", "沙發沒有回報力度變更") { st -> target.all { (a, v) -> st.intensity(a) == v } }
             }
             Running.MANUAL -> {
-                val next = target.entries.fold(manual) { m, (a, v) -> m.withIntensity(a, v) }
-                conn.enqueue(OsimProtocol.manualChanges(manual, next))
-                manual = next
+                val changed = target.entries.fold(manual) { m, (a, v) -> m.withIntensity(a, v) }
+                conn.enqueue(OsimProtocol.manualChanges(manual, changed))
+                manual = changed
                 report("已送出：${where}力度 $levels", speak = false)
                 expect("${where}力度已調為 $levels", "沙發沒有回報力度變更") { st -> target.all { (a, v) -> st.intensity(a) == v } }
             }
             Running.NONE -> {
                 manual = target.entries.fold(manual) { m, (a, v) -> m.withIntensity(a, v) }
-                report("目前沒有按摩：已把下次手動按摩的${where}力度設為 $levels")
+                if (fromVoice) report("目前沒有按摩：已把下次手動按摩的${where}力度設為 $levels")
             }
         }
+        afterStep()
+    }
+
+    /** 背部: technique, rolling, width. Manual massage only; an auto program runs its own. */
+    private fun rollers(what: String, change: ManualSettings.() -> ManualSettings) {
+        if (!allowed(Op.ADJUST)) return
+        val s = conn.status ?: return
+        val next = manual.change()
+        when (running(s)) {
+            Running.AUTO -> report("全身按摩中不能調整$what")
+            Running.MANUAL -> {
+                conn.enqueue(OsimProtocol.manualChanges(manual, next)); manual = next
+                report("已調整：$what")
+                afterStep()
+            }
+            Running.NONE -> { manual = next; report("目前沒有按摩：已設定下次手動按摩的$what") }
+        }
+        show(Zone.BACK)
+    }
+
+    private fun nextWidth(w: RollerWidth, wider: Boolean): RollerWidth {
+        val order = listOf(RollerWidth.NARROW, RollerWidth.MIDDLE, RollerWidth.WIDE)
+        val i = order.indexOf(w)
+        return if (i < 0) RollerWidth.MIDDLE else order[(i + if (wider) 1 else -1).coerceIn(order.indices)]
+    }
+
+    /** 「關閉背部」: the rollers off. In an auto program they cannot go alone, so everything stops —
+     *  whoever says this wants the rollers to stop, and that must happen. */
+    private fun backOff() {
+        val s = conn.status
+        if (s != null && running(s) == Running.AUTO) {
+            stopAll(Source.VOICE)
+            report("全身按摩無法單獨關閉背部，已全部停止")
+            return
+        }
+        if (!allowed(Op.ADJUST)) return
+        changeManual(manual.copy(kneadTap = KneadTap.OFF, rolling = Rolling.OFF))
+        if (s == null || running(s) == Running.NONE) report("目前沒有按摩：下次手動按摩不會使用背部滾輪")
+        show(Zone.BACK)
+    }
+
+    /** Read-only: answered from the last status, whatever [ControlPolicy] would say about commands. */
+    private fun answer(topic: VoiceCommand.Topic) {
+        val s = conn.status
+        report(when {
+            topic == VoiceCommand.Topic.HELP ->
+                "可以說：腰部按摩、背部加強、關閉足部、力度調到四、再強一點、躺平、還剩幾分鐘、停止"
+            s == null -> "尚未收到沙發狀態"
+            topic == VoiceCommand.Topic.REMAINING -> when {
+                !s.massageRunning -> "目前沒有進行中的按摩"
+                s.paused -> "按摩暫停中，約剩 ${s.remainingMin} 分鐘"
+                else -> "約剩 ${s.remainingMin} 分鐘"
+            }
+            topic == VoiceCommand.Topic.INTENSITY -> {
+                val v: (Area) -> Int = if (running(s) == Running.AUTO) { a -> s.intensity(a) } else { a -> manual.intensity(a) }
+                Area.entries.joinToString("、") { "${Names.area(it)} ${v(it)}" }
+            }
+            else -> "沙發目前：${summary(s)}"
+        })
     }
 
     private fun speed(faster: Boolean) {
@@ -358,27 +494,27 @@ class SofaController(private val conn: SofaConnection, private val store: Shared
         }
     }
 
-    private fun function(f: FootSeat, level: Level) {
+    private fun function(fs: List<FootSeat>, level: Level) {
         if (!allowed(Op.ADJUST)) return
         val s = conn.status ?: return
-        val name = Names.function(f)
+        val name = if (fs.size > 1) "足部按摩" else Names.function(fs.single())
         when (running(s)) {
             Running.AUTO -> {
                 // In an auto program OSIM only switches these on (AUTO) or off.
                 if (level == Level.LOW || level == Level.HIGH) { report("全身按摩中${name}只能開啟或關閉"); return }
-                conn.enqueue(listOf(OsimProtocol.footSeat(f, level)))
+                conn.enqueue(fs.map { OsimProtocol.footSeat(it, level) })
                 report("已送出：$name${level.zh}", speak = false)
-                expect("$name 已${if (level == Level.OFF) "關閉" else "開啟"}", "沙發沒有回報${name}變更") {
-                    (it.level(f) == Level.OFF) == (level == Level.OFF)
+                expect("$name 已${if (level == Level.OFF) "關閉" else "開啟"}", "沙發沒有回報${name}變更") { st ->
+                    fs.all { (st.level(it) == Level.OFF) == (level == Level.OFF) }
                 }
             }
-            Running.MANUAL -> {
-                val next = manual.withLevel(f, level)
-                conn.enqueue(OsimProtocol.manualChanges(manual, next)); manual = next
-                report("已送出：$name${level.zh}", speak = false)
+            Running.MANUAL -> changeManual(fs.fold(manual) { m, f -> m.withLevel(f, level) })
+            Running.NONE -> {
+                manual = fs.fold(manual) { m, f -> m.withLevel(f, level) }
+                if (fromVoice) report("目前沒有按摩：已把下次手動按摩的${name}設為${level.zh}")
             }
-            Running.NONE -> { manual = manual.withLevel(f, level); report("目前沒有按摩：已把下次手動按摩的${name}設為${level.zh}") }
         }
+        afterStep()
     }
 
     // ================================================================== app lifecycle

@@ -2,11 +2,13 @@ package com.example.osimsofa
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 
@@ -20,6 +22,8 @@ import androidx.compose.runtime.setValue
 class VoiceInput(
     private val context: Context,
     private val onResult: (candidates: List<String>, confidence: FloatArray?) -> Unit,
+    /** Every partial result, while still listening. */
+    private val onPartial: (String) -> Unit = {},
 ) {
     enum class State { IDLE, PERMISSION, LISTENING, PROCESSING, DONE, FAILED }
 
@@ -27,6 +31,8 @@ class VoiceInput(
     /** What the panel says: prompt, heard text and outcome, or the reason it failed. */
     var message by mutableStateOf<String?>(null); private set
     var partial by mutableStateOf<String?>(null); private set
+    /** How loud the microphone hears the user, 0–1, so they can see they are being heard. */
+    var level by mutableFloatStateOf(0f); private set
 
     private var recognizer: SpeechRecognizer? = null
     private var job = 0
@@ -47,8 +53,14 @@ class VoiceInput(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-TW")
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, VoiceParser.MAX_CANDIDATES)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+            // A short command is followed by silence: don't make the user wait for the default.
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+            if (Build.VERSION.SDK_INT >= 33) {
+                putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, ArrayList(VoiceParser.BIAS_PHRASES))
+            }
         }
-        state = State.LISTENING; message = "準備聆聽…"; partial = null
+        state = State.LISTENING; message = "準備聆聽…"; partial = null; level = 0f
         r.startListening(i)
     }
 
@@ -63,17 +75,26 @@ class VoiceInput(
 
     fun fail(text: String) { state = State.FAILED; message = text; partial = null }
 
+    /** A stop was heard before the end of the sentence: nothing that follows may run. */
+    fun finishEarly(text: String) {
+        job++
+        recognizer?.cancel()
+        done(text)
+    }
+
     fun destroy() { job++; recognizer?.destroy(); recognizer = null; state = State.IDLE }
 
     private fun listener(my: Int) = object : RecognitionListener {
         override fun onReadyForSpeech(p: Bundle?) { if (my == job) message = "請說出指令…" }
         override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(v: Float) {}
+        // Roughly -2 (silence) to 10 dB on the phones tried; only the movement matters.
+        override fun onRmsChanged(v: Float) { if (my == job) level = ((v + 2f) / 12f).coerceIn(0f, 1f) }
         override fun onBufferReceived(b: ByteArray?) {}
         override fun onEndOfSpeech() { if (my == job && state == State.LISTENING) { state = State.PROCESSING; message = "辨識中…" } }
         override fun onPartialResults(p: Bundle?) {
             if (my != job) return
             partial = p?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.takeIf { it.isNotBlank() }
+            partial?.let(onPartial)
         }
         override fun onResults(r: Bundle?) {
             if (my != job) return

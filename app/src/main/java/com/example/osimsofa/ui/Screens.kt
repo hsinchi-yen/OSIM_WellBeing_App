@@ -3,6 +3,7 @@ package com.example.osimsofa.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -44,8 +45,6 @@ import androidx.compose.material.icons.filled.AirlineSeatReclineNormal
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.ExpandLess
-import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
@@ -80,6 +79,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -89,6 +89,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -99,6 +101,7 @@ import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -110,20 +113,19 @@ import com.example.osimsofa.FullBodySession.Stage
 import com.example.osimsofa.MoveToTarget
 import com.example.osimsofa.Names
 import com.example.osimsofa.OsimProtocol
+import com.example.osimsofa.OsimProtocol.Area
 import com.example.osimsofa.OsimProtocol.AutoProfile
 import com.example.osimsofa.OsimProtocol.AutoProgram
-import com.example.osimsofa.OsimProtocol.BackSpeed
-import com.example.osimsofa.OsimProtocol.KneadTap
+import com.example.osimsofa.OsimProtocol.FootSeat
 import com.example.osimsofa.OsimProtocol.Level
 import com.example.osimsofa.OsimProtocol.ManualSettings
 import com.example.osimsofa.OsimProtocol.Posture
-import com.example.osimsofa.OsimProtocol.RollerWidth
-import com.example.osimsofa.OsimProtocol.Rolling
 import com.example.osimsofa.SofaConnection
 import com.example.osimsofa.SofaConnection.Phase
 import com.example.osimsofa.SofaController
 import com.example.osimsofa.SofaStatus
 import com.example.osimsofa.VoiceInput
+import com.example.osimsofa.Zone
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -138,6 +140,9 @@ class SofaActions(
     val setWant30: (Boolean) -> Unit,
     val startManual: () -> Unit,
     val changeManual: (ManualSettings) -> Unit,
+    val setIntensity: (Area, Int) -> Unit,
+    val setFunction: (FootSeat, Level) -> Unit,
+    val focusZone: (Zone) -> Unit,
     val pauseOrResume: () -> Unit,
     val stop: () -> Unit,
     val scan: () -> Unit,
@@ -175,6 +180,18 @@ fun SofaApp(conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: 
     SofaTheme {
         var page by rememberSaveable { mutableStateOf(Page.MAIN) }
         BackHandler(enabled = page != Page.MAIN) { page = Page.MAIN }
+        // Kept here, not in ControlScreen: that leaves the composition for the guide and for a
+        // reconnect, and rememberSaveable state goes with it — the tab would reset, and a voice
+        // request already shown would count as new and jump to it again.
+        var tab by rememberSaveable { mutableStateOf(ControlTab.HOME) }
+        var zone by rememberSaveable { mutableStateOf(Zone.BACK) }
+        var spotlightSeen by rememberSaveable { mutableIntStateOf(0) }
+        // What was just said about a part of the body is shown: the screen follows the voice.
+        LaunchedEffect(ctrl.spotlight) {
+            ctrl.spotlight?.takeIf { it.nonce != spotlightSeen }?.let {
+                spotlightSeen = it.nonce; zone = it.zone; tab = ControlTab.ZONES
+            }
+        }
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             // While connected, Stop is on every page — the sofa may be moving while you read the guide.
             val stopBar: @Composable () -> Unit = {
@@ -184,7 +201,7 @@ fun SofaApp(conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: 
                 Page.GUIDE -> GuideScreen(stopBar) { page = Page.MAIN }
                 Page.DIAGNOSTICS -> DiagnosticsScreen(conn, env, actions, stopBar) { page = Page.MAIN }
                 Page.MAIN ->
-                    if (conn.phase == Phase.READY) ControlScreen(conn, ctrl, voice, env, actions, onPage = { page = it })
+                    if (conn.phase == Phase.READY) ControlScreen(conn, ctrl, voice, env, actions, tab, { tab = it }, zone, { zone = it }, onPage = { page = it })
                     else ConnectScreen(conn, env, actions, onPage = { page = it })
             }
         }
@@ -330,37 +347,92 @@ private fun Pulse(active: Boolean, core: androidx.compose.ui.graphics.drawscope.
 
 // ================================================================ control screen
 
+private enum class ControlTab(val zh: String) { HOME("總覽"), ZONES("部位按摩") }
+
 @Composable
-private fun ControlScreen(conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: UiEnv, a: SofaActions, onPage: (Page) -> Unit) {
+private fun ControlScreen(
+    conn: SofaConnection, ctrl: SofaController, voice: VoiceInput, env: UiEnv, a: SofaActions,
+    tab: ControlTab, onTab: (ControlTab) -> Unit, zone: Zone, onZone: (Zone) -> Unit, onPage: (Page) -> Unit,
+) {
     val list = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val status = conn.status
     val age by produceState(conn.statusAgeMs(), conn.status) {
         while (true) { value = conn.statusAgeMs(); delay(1_000) }
     }
+    BackHandler(enabled = tab != ControlTab.HOME) { onTab(ControlTab.HOME) }
     Scaffold(
         containerColor = SofaColors.Ink,
-        topBar = { DeviceBar(conn, a, onPage) },
+        topBar = {
+            Column(Modifier.background(SofaColors.Ink)) {
+                DeviceBar(conn, a, onPage)
+                TabSwitcher(tab, onTab)
+            }
+        },
         bottomBar = {
             Column(Modifier.background(SofaColors.Surface).navigationBarsPadding()) {
                 AnimatedVisibility(visible = voice.state != VoiceInput.State.IDLE) { VoicePanel(voice, env, a) }
                 EventLine(ctrl.lastEvent)
-                QuickBar(ctrl, a, onFullBodyBusy = { scope.launch { list.animateScrollToItem(FULL_BODY_ITEM) } })
+                QuickBar(ctrl, a, onFullBodyBusy = {
+                    onTab(ControlTab.HOME)
+                    scope.launch { list.animateScrollToItem(FULL_BODY_ITEM) }
+                })
             }
         },
     ) { padding ->
-        LazyColumn(
-            state = list,
-            contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = padding.calculateTopPadding() + 8.dp,
-                bottom = padding.calculateBottomPadding() + 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            item(key = "banners") { Banners(status, age) }
-            item(key = "status") { StatusCard(status, ctrl, a) }
-            item(key = "postures") { PostureSection(status, ctrl, a) }
-            item(key = "fullbody") { FullBodyCard(status, ctrl, a) }
-            item(key = "manual") { ManualCard(status, ctrl, a) }
-            item(key = "more") { MoreRow(a, onPage) }
+        when (tab) {
+            ControlTab.HOME -> LazyColumn(
+                state = list,
+                contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = padding.calculateTopPadding() + 8.dp,
+                    bottom = padding.calculateBottomPadding() + 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item(key = "banners") { Banners(status, age) }
+                item(key = "status") { StatusCard(status, ctrl, a) }
+                item(key = "postures") { PostureSection(status, ctrl, a) }
+                item(key = "fullbody") { FullBodyCard(status, ctrl, a) }
+                item(key = "zones") { ZoneShortcuts { onZone(it); onTab(ControlTab.ZONES) } }
+                item(key = "more") { MoreRow(a, onPage) }
+            }
+            ControlTab.ZONES -> ZoneTab(status, age, ctrl, a, zone, onZone, padding)
+        }
+    }
+}
+
+@Composable
+private fun TabSwitcher(tab: ControlTab, onPick: (ControlTab) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 8.dp)
+        .background(SofaColors.Surface, CircleShape).padding(4.dp)) {
+        ControlTab.entries.forEach { t ->
+            val on = t == tab
+            Box(
+                Modifier.weight(1f).heightIn(min = 44.dp)
+                    .background(if (on) SofaColors.Champagne else SofaColors.Surface, CircleShape)
+                    .semantics { role = Role.Tab; selected = on }
+                    .clickable { onPick(t) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(t.zh, style = MaterialTheme.typography.labelLarge, color = if (on) SofaColors.OnChampagne else SofaColors.Muted)
+            }
+        }
+    }
+}
+
+/** Straight from the overview to one part of the body. */
+@Composable
+private fun ZoneShortcuts(onZone: (Zone) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionTitle("部位按摩", "只按想放鬆的地方")
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Zone.entries.forEach { z ->
+                // Goes somewhere rather than choosing something, so not a Chip (TalkBack: 「未選」).
+                Surface(onClick = { onZone(z) }, Modifier.weight(1f).heightIn(min = 48.dp), shape = CircleShape,
+                    color = SofaColors.SurfaceHigher, contentColor = SofaColors.Text) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text(z.zh, Modifier.padding(vertical = 12.dp), style = MaterialTheme.typography.labelLarge, textAlign = TextAlign.Center)
+                    }
+                }
+            }
         }
     }
 }
@@ -393,8 +465,9 @@ private fun DeviceBar(conn: SofaConnection, a: SofaActions, onPage: (Page) -> Un
 @Composable
 private fun QuickBar(ctrl: SofaController, a: SofaActions, onFullBodyBusy: () -> Unit) {
     val fullBodyBusy = ctrl.session?.let { it.stage != Stage.FAILED } == true
-    // Large font: no icons and two lines allowed, so 「語音控制」 is never cut to 「語音」.
-    val big = LocalDensity.current.fontScale > 1.3f
+    // Large font: no icons and two lines allowed, so 「語音控制」 is never cut to 「語音」 or broken
+    // mid-word. From 1.25: a 360 dp phone at font scale 1.3 already has no room for the icon.
+    val big = LocalDensity.current.fontScale >= 1.25f
     @Composable fun Label(icon: ImageVector, text: String, bold: Boolean = false) {
         if (!big) { Icon(icon, null); Spacer(Modifier.width(4.dp)) }
         Text(text, maxLines = 2, textAlign = TextAlign.Center, fontWeight = if (bold) FontWeight.SemiBold else null)
@@ -436,12 +509,9 @@ private fun EventLine(e: SofaController.UserEvent?) {
 @Composable
 private fun VoicePanel(voice: VoiceInput, env: UiEnv, a: SofaActions) {
     Column(Modifier.fillMaxWidth().background(SofaColors.SurfaceHigher).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        val listening = voice.state == VoiceInput.State.LISTENING
         Row(verticalAlignment = Alignment.CenterVertically) {
-            val listening = voice.state == VoiceInput.State.LISTENING
-            Box(Modifier.size(40.dp).background(if (listening) SofaColors.Champagne else SofaColors.SurfaceHigh, CircleShape),
-                contentAlignment = Alignment.Center) {
-                Icon(Icons.Filled.Mic, null, tint = if (listening) SofaColors.OnChampagne else SofaColors.Champagne)
-            }
+            MicIndicator(listening, voice.level)
             Spacer(Modifier.width(12.dp))
             Text(
                 when (voice.state) {
@@ -457,10 +527,9 @@ private fun VoicePanel(voice: VoiceInput, env: UiEnv, a: SofaActions) {
             IconButton(onClick = a.voiceCancel) { Icon(Icons.Filled.Close, contentDescription = "關閉語音") }
         }
         voice.message?.let { Text(it, style = MaterialTheme.typography.bodyLarge, color = SofaColors.Text) }
-        voice.partial?.let { Text("「$it」", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted) }
-        if (voice.state == VoiceInput.State.LISTENING || voice.state == VoiceInput.State.PERMISSION) {
-            Text("可以說：「坐式」「躺平」「回到沙發」「開始全身按摩 15 分鐘」「暫停」「繼續」「停止」",
-                style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
+        voice.partial?.let { Text("「$it」", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Champagne) }
+        if (listening || voice.state == VoiceInput.State.PERMISSION) {
+            VOICE_HINTS.forEach { (topic, examples) -> VoiceHint(topic, examples) }
         }
         env.ttsProblem?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = SofaColors.Champagne) }
         if (voice.state == VoiceInput.State.DONE || voice.state == VoiceInput.State.FAILED) {
@@ -469,8 +538,37 @@ private fun VoicePanel(voice: VoiceInput, env: UiEnv, a: SofaActions) {
     }
 }
 
+private val VOICE_HINTS = listOf(
+    "部位" to "腰部按摩・背部加強・關閉足部",
+    "力度" to "力度調到 4・腰部最強・再強一點",
+    "姿勢" to "坐式・躺平・回到沙發",
+    "查詢" to "還剩幾分鐘・力度多少",
+)
+
 @Composable
-private fun Banners(s: SofaStatus?, age: Long?) {
+private fun VoiceHint(topic: String, examples: String) {
+    Row {
+        Text(topic, Modifier.width(44.dp), style = MaterialTheme.typography.bodyMedium, color = SofaColors.Champagne)
+        Text(examples, style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
+    }
+}
+
+/** The ring follows the voice: seeing it move is how you know the phone hears you. */
+@Composable
+private fun MicIndicator(listening: Boolean, level: Float) {
+    val heard by animateFloatAsState(if (listening) level else 0f, tween(120), label = "mic")
+    Box(Modifier.size(52.dp), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val r = size.minDimension / 2f
+            drawCircle(SofaColors.Champagne.copy(alpha = 0.28f), radius = r * (0.74f + 0.26f * heard))
+            drawCircle(if (listening) SofaColors.Champagne else SofaColors.SurfaceHigh, radius = r * 0.74f)
+        }
+        Icon(Icons.Filled.Mic, null, tint = if (listening) SofaColors.OnChampagne else SofaColors.Champagne)
+    }
+}
+
+@Composable
+internal fun Banners(s: SofaStatus?, age: Long?) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         if (s != null && s.fault) {
             Card(colors = CardDefaults.cardColors(containerColor = SofaColors.CoralDeep), border = BorderStroke(1.dp, SofaColors.Coral)) {
@@ -494,13 +592,31 @@ private fun Banners(s: SofaStatus?, age: Long?) {
     }
 }
 
-/** Current posture + massage, with the single 暫停／繼續 button while a massage runs. */
+/** Where the sofa is and what it is doing, first thing on the screen; 暫停／繼續 while a massage runs. */
 @Composable
 private fun StatusCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = SofaColors.SurfaceHigh)) {
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            StatusLine("目前姿勢", ctrl.moving?.let { "移動中 → ${Names.short(it.target)}" } ?: Names.posture(s))
-            StatusLine("按摩", Names.massage(s))
+    val running = s != null && s.massageRunning
+    val big = LocalDensity.current.fontScale > 1.4f
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = SofaColors.Surface),
+        border = BorderStroke(1.dp, if (running) SofaColors.ChampagneDeep else SofaColors.Line)) {
+        Column(
+            Modifier.fillMaxWidth().background(Brush.linearGradient(listOf(SofaColors.SurfaceHigher, SofaColors.Surface)))
+                .padding(horizontal = 18.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("目前姿勢", style = MaterialTheme.typography.labelMedium, color = SofaColors.Muted)
+                    Text(ctrl.moving?.let { "移動中 → ${Names.short(it.target)}" } ?: Names.posture(s), style = MaterialTheme.typography.headlineSmall)
+                    Spacer(Modifier.height(6.dp))
+                    Text("按摩", style = MaterialTheme.typography.labelMedium, color = SofaColors.Muted)
+                    Text(Names.massage(s), style = MaterialTheme.typography.titleMedium, color = if (running) SofaColors.Champagne else SofaColors.Text)
+                }
+                if (running && !big && s != null) {
+                    Spacer(Modifier.width(12.dp))
+                    TimeRing(s)
+                }
+            }
             if (s != null && (s.footFrontLimit || s.ottoman || !s.footBackLimit)) {
                 StatusLine("腳托", when {
                     s.footFrontLimit -> "伸出到底"
@@ -509,12 +625,31 @@ private fun StatusCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
                 } + if (s.ottoman) "（足部按摩架為腳凳模式，腳托無法收回）" else "")
             }
             if (s != null && s.massageRunning) {
-                Spacer(Modifier.height(4.dp))
                 FilledTonalButton(onClick = a.pauseOrResume, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
                     Icon(if (s.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause, null); Spacer(Modifier.width(8.dp))
                     Text(if (s.paused) "繼續按摩" else "暫停按摩")
                 }
             }
+        }
+    }
+}
+
+/** Minutes left, as the part of the session still to come. */
+@Composable
+private fun TimeRing(s: SofaStatus) {
+    val total = (s.remainingMin + s.elapsedMin).coerceAtLeast(1)
+    val left = s.remainingMin.toFloat() / total
+    Box(Modifier.size(84.dp).semantics(mergeDescendants = true) { stateDescription = "約剩 ${s.remainingMin} 分鐘" }, contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val w = 6.dp.toPx()
+            drawCircle(SofaColors.Line, radius = size.minDimension / 2f - w / 2f, style = Stroke(w))
+            drawArc(if (s.paused) SofaColors.Muted else SofaColors.Champagne, startAngle = -90f, sweepAngle = 360f * left,
+                useCenter = false, topLeft = androidx.compose.ui.geometry.Offset(w / 2f, w / 2f),
+                size = androidx.compose.ui.geometry.Size(size.width - w, size.height - w), style = Stroke(w, cap = StrokeCap.Round))
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("${s.remainingMin}", style = MaterialTheme.typography.headlineSmall)
+            Text("分鐘", style = MaterialTheme.typography.labelMedium, color = SofaColors.Muted)
         }
     }
 }
@@ -541,9 +676,10 @@ private fun PostureSection(s: SofaStatus?, ctrl: SofaController, a: SofaActions)
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionTitle("姿勢", "點一下：自動到位　按住：放開即停")
         BoxWithConstraints {
-            // Phones: one full-width row per preset (three columns break 「沙發（待機）」 mid-word at
-            // 411 dp); three columns only on tablets / landscape.
-            val stacked = maxWidth < 600.dp || LocalDensity.current.fontScale > 1.3f
+            // Three tiles side by side, with the short names; large fonts and narrow screens (a
+            // tile on a 360 dp phone has about 73 dp of text width) get one full-width row per
+            // preset, so nothing breaks mid-word.
+            val stacked = maxWidth < 340.dp || LocalDensity.current.fontScale >= 1.25f
             val cards: List<@Composable (Modifier) -> Unit> = listOf(
                 { m -> PostureCard(Posture.UPRIGHT, Icons.Filled.AirlineSeatReclineNormal, s, ctrl, a, stacked, m) },
                 { m -> PostureCard(Posture.RECLINE, Icons.Filled.AirlineSeatReclineExtra, s, ctrl, a, stacked, m) },
@@ -595,10 +731,11 @@ private fun PostureCard(p: Posture, icon: ImageVector, s: SofaStatus?, ctrl: Sof
     val movingNow by rememberUpdatedState(movingHere)
     val current = s != null && MoveToTarget.reached(p, s)
     val sub = when {
-        movingHere && ctrl.moving?.mode == MoveToTarget.Mode.HOLD -> "移動中…放開即停"
-        movingHere -> "移動中…點一下停止"
+        movingHere && ctrl.moving?.mode == MoveToTarget.Mode.HOLD -> if (wide) "移動中…放開即停" else "放開即停"
+        movingHere -> if (wide) "移動中…點一下停止" else "點一下停止"
         current -> "目前位置"
-        else -> Names.hint(p)
+        wide -> Names.hint(p)
+        else -> "點一下調整"
     }
     Card(
         modifier
@@ -627,7 +764,7 @@ private fun PostureCard(p: Posture, icon: ImageVector, s: SofaStatus?, ctrl: Sof
     ) {
         val text: @Composable () -> Unit = {
             Column {
-                Text(Names.label(p), style = MaterialTheme.typography.titleMedium)
+                Text(if (wide) Names.label(p) else Names.short(p), style = MaterialTheme.typography.titleMedium)
                 Text(sub, style = MaterialTheme.typography.bodyMedium, color = if (current && !movingHere) SofaColors.Sage else SofaColors.Muted)
             }
         }
@@ -713,70 +850,6 @@ private fun FullBodyCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
     }
 }
 
-// ---------------------------------------------------------------- manual
-
-@Composable
-private fun ManualCard(s: SofaStatus?, ctrl: SofaController, a: SofaActions) {
-    var open by rememberSaveable { mutableStateOf(false) }
-    val m = ctrl.manual
-    val running = s?.programNo == OsimProtocol.MANUAL_PROGRAM_NO
-    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = SofaColors.Surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { open = !open }
-                .semantics { stateDescription = if (open) "已展開" else "已收合" }, verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(Names.MANUAL, style = MaterialTheme.typography.titleLarge, modifier = Modifier.semantics { heading() })
-                    Text("${m.kneadTap.zh}・${m.rolling.zh}・力度 ${m.shoulder}/${m.back}/${m.lumbar}・足部${m.footVibration.zh}",
-                        style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
-                }
-                Icon(if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = null)
-            }
-            if (running && s != null) {
-                Text("沙發回報：肩 ${s.shoulderIntensity}・背 ${s.backIntensity}・腰 ${s.lumbarIntensity}・速度${s.backSpeed.zh}",
-                    style = MaterialTheme.typography.bodyMedium, color = SofaColors.Sage)
-            }
-            if (open) {
-                ManualGroup("背部") {
-                    ChoiceRow("揉捏／敲打", KneadTap.entries, m.kneadTap, { it.zh }) { a.changeManual(m.copy(kneadTap = it)) }
-                    ChoiceRow("滾動", Rolling.entries, m.rolling, { it.zh }) { a.changeManual(m.copy(rolling = it)) }
-                    ChoiceRow("背部速度", BackSpeed.entries, m.speed, { it.zh }) { a.changeManual(m.copy(speed = it)) }
-                    ChoiceRow("滾輪寬度", RollerWidth.entries, m.width, { it.zh }) { a.changeManual(m.copy(width = it)) }
-                    LevelStepper("肩部力度", m.shoulder) { a.changeManual(m.copy(shoulder = it)) }
-                    LevelStepper("背部力度", m.back) { a.changeManual(m.copy(back = it)) }
-                    LevelStepper("腰部力度", m.lumbar) { a.changeManual(m.copy(lumbar = it)) }
-                }
-                ManualGroup("足部") {
-                    ChoiceRow("足部揉捏", Level.entries, m.footKneading, { it.zh }) { a.changeManual(m.copy(footKneading = it)) }
-                    ChoiceRow("足部振動", Level.entries, m.footVibration, { it.zh }) { a.changeManual(m.copy(footVibration = it)) }
-                }
-                ManualGroup("臀部") {
-                    ChoiceRow("臀部振動", Level.entries, m.seatVibration, { it.zh }) { a.changeManual(m.copy(seatVibration = it)) }
-                }
-            }
-            Text(if (running) "手動按摩進行中：調整會立即送出" else "這些設定在按下「開始手動按摩」時套用",
-                style = MaterialTheme.typography.bodyMedium, color = if (running) SofaColors.Sage else SofaColors.Muted)
-            if (!running) {
-                if (s?.posture == Posture.SOFA) Text("背部按摩需要先調整為「坐式」或「躺平」", style = MaterialTheme.typography.bodyMedium, color = SofaColors.Champagne)
-                Button(onClick = a.startManual, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("開始手動按摩") }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ManualGroup(title: String, content: @Composable () -> Unit) {
-    var open by rememberSaveable(title) { mutableStateOf(title == "背部") }
-    Column(Modifier.fillMaxWidth().background(SofaColors.SurfaceHigh, MaterialTheme.shapes.small).padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { open = !open }
-            .semantics { stateDescription = if (open) "已展開" else "已收合" }, verticalAlignment = Alignment.CenterVertically) {
-            Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-            Icon(if (open) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore, contentDescription = null)
-        }
-        if (open) content()
-    }
-}
-
 @Composable
 private fun MoreRow(a: SofaActions, onPage: (Page) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -838,17 +911,32 @@ private fun GuideScreen(stopBar: @Composable () -> Unit, onBack: () -> Unit) {
                 "按摩進行中，上方狀態卡有「暫停按摩／繼續按摩」。",
                 "下方「停止」隨時可用：立刻停止移動、按摩與回位。",
             ))
+            GuideCard("部位按摩", listOf(
+                "到「部位按摩」分頁，點身體圖或清單選肩部、背部、腰部、腿足、臀部，再調整該部位。",
+                "「只按摩…」只開啟這個部位；手動按摩進行中則改為「加強…」，其他部位不變。",
+                "肩、背、腰共用同一組滾輪：力度可以分開調，開關只能一起。",
+                "背部按摩需要坐式或躺平；App 不會為了部位按摩自動移動沙發。",
+                "足部按摩架要在足部按摩模式（不是腳凳模式）。",
+                "全身按摩進行中可調力度與足部、臀部開關；背部手法由程式決定。",
+                "椅背與腳托不能單獨移動，只有坐式、躺平、沙發三種姿勢。",
+            ))
             GuideCard("手動按摩", listOf(
-                "展開「手動按摩」，分背部、足部、臀部設定，按「開始手動按摩」。",
+                "在「部位按摩」分頁調好各部位，按「開始手動按摩」。",
                 "手動按摩進行中，調整會立即送出；其他時候會在下次開始時套用。",
             ))
             GuideCard("語音控制（中文）", listOf(
                 "點下方「語音控制」說一次指令（每次點一下聽一次，不會一直開著麥克風）。",
                 "姿勢：「坐式」（坐直、坐姿也可）、「躺平」、「回到沙發」。",
                 "全身按摩：「開始全身按摩 15 分鐘」「開始全身按摩 30 分鐘」；沒說時間就是 15 分鐘。",
-                "其他：「開始手動按摩」「暫停」「繼續」「停止」「加強」「減弱」「肩部加強」「關閉足部振動」。",
+                "部位：「腰部按摩」「背部按摩」「腿部按摩」「肩部按摩」「臀部按摩」。",
+                "力度：「背部加強」「腰部減弱」「腰部力度調到 4」「肩部最輕」「太大力了」；接著說「再強一點」會調同一個部位。",
+                "足部與臀部：「足部加強」「關閉足部」「關閉足部振動」「開啟臀部」。",
+                "背部手法：「敲打」「揉捏」「局部滾動」「滾輪寬一點」「關閉背部」。",
+                "查詢：「還剩幾分鐘」「力度多少」「現在什麼姿勢」「可以說什麼」。",
+                "其他：「開始手動按摩」「暫停」「繼續」「停止」「加強」「減弱」。",
                 "說法相近或同音也聽得懂（例如辨識成「做直」也算坐直）。",
-                "「不要躺平」、問句（例如「沙發怎麼用？」）或一次說兩個指令都不會執行；說「停止」一定會停。",
+                "「不要躺平」、其他問句（例如「沙發怎麼用？」）或一次說兩個指令都不會執行；說「停止」一定會停，話還沒說完就會停。",
+                "「腳抬高」「椅背往後」不會執行：椅背與腳托不能單獨移動。",
             ))
             GuideCard("縮小 App 時", listOf(
                 "按主畫面鍵、切到其他 App、關螢幕或開啟 Spotify：沙發維持目前狀態，進行中的按摩或移動會照常完成。",
@@ -901,14 +989,14 @@ private fun DiagnosticsScreen(conn: SofaConnection, env: UiEnv, a: SofaActions, 
 
 // ================================================================ components
 
-@Composable private fun SectionTitle(title: String, hint: String? = null) {
+@Composable internal fun SectionTitle(title: String, hint: String? = null) {
     Column(Modifier.padding(top = 6.dp)) {
         Text(title, style = MaterialTheme.typography.titleLarge, modifier = Modifier.semantics { heading() })
         if (hint != null) Text(hint, style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
     }
 }
 
-@Composable private fun Chip(label: String, selected: Boolean, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+@Composable internal fun Chip(label: String, selected: Boolean, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
     Surface(
         modifier.heightIn(min = 48.dp).semantics { role = Role.RadioButton; stateDescription = if (selected) "已選" else "未選" }
             .clickable(enabled = enabled, onClick = onClick),
@@ -922,25 +1010,12 @@ private fun DiagnosticsScreen(conn: SofaConnection, env: UiEnv, a: SofaActions, 
     }
 }
 
-@Composable private fun <T> ChoiceRow(label: String, options: List<T>, selected: T, name: (T) -> String, onPick: (T) -> Unit) {
+@Composable internal fun <T> ChoiceRow(label: String, options: List<T>, selected: T, name: (T) -> String, enabled: Boolean = true, onPick: (T) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(label, style = MaterialTheme.typography.bodyMedium, color = SofaColors.Muted)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            options.forEach { o -> Chip(name(o), o == selected, Modifier.weight(1f)) { onPick(o) } }
+            options.forEach { o -> Chip(name(o), o == selected, Modifier.weight(1f), enabled) { onPick(o) } }
         }
-    }
-}
-
-@Composable private fun LevelStepper(label: String, value: Int, onChange: (Int) -> Unit) {
-    Row(Modifier.fillMaxWidth().semantics(mergeDescendants = true) { stateDescription = "$label $value" }, verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-        OutlinedButton(onClick = { onChange(value - 1) }, enabled = value > OsimProtocol.INTENSITY.first,
-            shape = CircleShape, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(52.dp)
-                .semantics { this.onClick(label = "$label 減弱") { onChange(value - 1); true } }) { Text("−", style = MaterialTheme.typography.titleLarge) }
-        Text("$value", Modifier.width(44.dp), style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
-        Button(onClick = { onChange(value + 1) }, enabled = value < OsimProtocol.INTENSITY.last,
-            shape = CircleShape, contentPadding = PaddingValues(0.dp), modifier = Modifier.size(52.dp)
-                .semantics { this.onClick(label = "$label 加強") { onChange(value + 1); true } }) { Text("＋", style = MaterialTheme.typography.titleLarge) }
     }
 }
 
