@@ -41,6 +41,8 @@ The flows, the policy, the parser and `MbLink` are pure Kotlin and unit-tested o
 ## Build and test
 
 JDK 17 and the Android SDK (platform 35, build-tools 35.0.0); `local.properties` points `sdk.dir` at it.
+Optional, also in the untracked `local.properties`: `sofa.mainboard.serial=<serial>` prefers that module
+before the first connection. Without it the app takes the only sofa module nearby, or lists them.
 
 ```
 ./gradlew testDebugUnitTest lintDebug assembleDebug      # or ../tools/gradle-8.7/bin/gradle …

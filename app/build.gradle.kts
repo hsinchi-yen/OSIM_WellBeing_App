@@ -1,7 +1,17 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+// One sofa's serial is personal, so it stays out of git: put sofa.mainboard.serial in the untracked
+// local.properties to prefer that module before the first connection. Without it nothing is wrong:
+// the app takes the only sofa module nearby, or lists them.
+val localProperties = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
+}
+val mainboardSerial: String = localProperties.getProperty("sofa.mainboard.serial", "")
 
 android {
     namespace = "com.example.osimsofa"
@@ -14,6 +24,7 @@ android {
         versionCode = 16
         versionName = "0.5.0"
         vectorDrawables { useSupportLibrary = true }
+        buildConfigField("String", "DEFAULT_MAINBOARD_SERIAL", "\"$mainboardSerial\"")
     }
 
     buildTypes {

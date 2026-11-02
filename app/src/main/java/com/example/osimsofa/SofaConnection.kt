@@ -176,7 +176,8 @@ class SofaConnection(private val app: Context) {
     /**
      * Which sofa module to connect, or keep waiting:
      * 1. the NFC-tapped sofa, when the tag's serial is in a Bluetooth name;
-     * 2. the module connected last time (OSIM's 12345678 before the first connection);
+     * 2. the module connected last time (before the first connection, the build's
+     *    [BuildConfig.DEFAULT_MAINBOARD_SERIAL], if it has one);
      * 3. the only sofa module around.
      * The tag may carry the product serial (0000X-…) rather than the module's (uDivaSOFA_12345678),
      * and one sofa has two modules that do not always advertise together — so a tap whose serial
@@ -217,8 +218,8 @@ class SofaConnection(private val app: Context) {
     private fun String?.endsWithSerial(s: String?): Boolean =
         this != null && s != null && s.isNotEmpty() && lowercase().endsWith(s.lowercase())
 
-    /** The serial of the last sofa that reached READY (the mainboard module OSIM uses before that). */
-    private fun rememberedSerial(): String = prefs.getString(KEY_LAST_SERIAL, null) ?: DEFAULT_MAINBOARD_SERIAL
+    /** The serial of the last sofa that reached READY (before that, the one this build was given). */
+    private fun rememberedSerial(): String = prefs.getString(KEY_LAST_SERIAL, null) ?: BuildConfig.DEFAULT_MAINBOARD_SERIAL
 
     private fun isSofaName(n: String): Boolean {
         val l = n.lowercase()
@@ -616,8 +617,6 @@ class SofaConnection(private val app: Context) {
     }
 
     companion object {
-        /** The mainboard module the OSIM app connects to; used until a sofa has been connected once. */
-        const val DEFAULT_MAINBOARD_SERIAL = "12345678"
         const val REQUEST_MTU = 512              // flutter_blue_plus default, as OSIM uses
         const val SCAN_MS = 15_000L
         const val SINGLE_PICK_MS = 4_000L

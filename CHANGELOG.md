@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 (versionCode 16) — 2026-11-02
+
+Massage by body part, a wider voice vocabulary and a tabbed screen. **No new key code**, and the
+protocol, link and movement code is unchanged. The zone behaviour has not been tried at a sofa yet.
+
+- **Zones:** 肩部、背部、腰部、腿足、臀部 as a view over the existing manual settings. 「只按摩…」 or
+  「腰部按摩」 runs one zone from idle and never moves the sofa; where it has to be, the app says so.
+- **Backrest and footrest stay presets.** Their independent keys are decompile-only and never
+  appear in the capture, so they are not sent; 「腳抬高」「椅背往後」 are refused with a reason, and a
+  test fails if such a key is added.
+- **Voice:** zone massage, levels 1–5 (「腰部力度調到 4」「背部最輕」), 「再強一點」 for the part adjusted
+  last, technique, rolling and width, and read-only questions (「還剩幾分鐘」「力度多少」). A whole
+  stop word stops while still listening. Android 13+ tells the recogniser what to expect.
+- **Fixed:** 「開始足部按摩」 started a full-body massage, which reclines. 「太大力了」 read as stronger.
+  Intensity changed on screen during an auto program was kept for later instead of sent. Waiting
+  for a confirmation armed no timeout, so a missing report went unnoticed.
+- **Screen:** 總覽／部位按摩 tabs with a body map, a status card with the time left, and layouts for
+  a 360 dp phone at font scale 1.3. Back on 部位按摩 returns to 總覽.
+- **Private data:** one sofa's serial and Bluetooth addresses are gone from the source and its
+  history; a build can take a serial from the untracked `local.properties`.
+
 ## 0.4.1 (versionCode 15) — 2026-10-25
 
 Three behaviours changed by the user after reviewing 0.4.0 (they replace the plan's §7 return
